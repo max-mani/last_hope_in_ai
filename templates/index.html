@@ -601,7 +601,6 @@
 
       <footer>UYIR Foundation · Road Accident Detection System · Tamil Nadu Police Pilot Programme</footer>
     </div>
-
     <script>
       // ── State ──────────────────────────────────────────────────────
       const $ = id => document.getElementById(id);
@@ -609,6 +608,18 @@
       let incidentStore = { confirmed: [], suspicious: [], suppressed: [] };
       const TAB_BTN_IDS = { confirmed: "tab-conf", suspicious: "tab-susp", suppressed: "tab-supp" };
       let curTab = "confirmed";
+
+      // ── API auth ───────────────────────────────────────────────────
+      // Stopgap shared-secret key, checked server-side against
+      // config.API_KEY / the UYIR_API_KEY env var (see app.py's
+      // require_api_key dependency). This value MUST match the server's
+      // key exactly, or every mutating request below returns 401.
+      // It lives in plain sight in this file because it's client-side
+      // JS — that's the known limitation of a shared-secret stopgap;
+      // treat it as a "keep honest people out" speed bump, not real
+      // security, and replace with real login before production use.
+      const UYIR_API_KEY = "uyir-dev-key-change-me";
+      const AUTH_HEADERS = { "X-API-Key": UYIR_API_KEY };
 
       // ── Toast notification (confirmed accidents only) ──────────────
       function showToast(title, body) {
@@ -653,7 +664,8 @@
         const btn = $("clear-all-btn");
         if (btn) { btn.disabled = true; btn.textContent = "Clearing…"; }
         try {
-          const res = await fetch("/api/incidents", { method: "DELETE" });
+          const res = await fetch("/api/incidents", { method: "DELETE", headers: AUTH_HEADERS });
+          if (res.status === 401) { showErr("API key rejected — check UYIR_API_KEY matches the server."); return; }
           if (res.ok) {
             incidentStore = { confirmed: [], suspicious: [], suppressed: [] };
             ["confirmed","suspicious","suppressed"].forEach(b => renderTab(b));
@@ -742,7 +754,8 @@
         const thr = parseFloat($("thr-slider").value) / 100;
         let jobId;
         try {
-          const res = await fetch(`/start-stream?threshold=${thr}`, { method:"POST", body:fd });
+          const res = await fetch(`/start-stream?threshold=${thr}`, { method:"POST", headers: AUTH_HEADERS, body:fd });
+          if (res.status === 401) throw new Error("API key rejected — check UYIR_API_KEY matches the server.");
           if (!res.ok) throw new Error(`Upload failed HTTP ${res.status}`);
           jobId = (await res.json()).job_id;
         } catch(e) {
@@ -1070,13 +1083,18 @@
         if (!curFeatures) return;
         $("log-msg").style.color = "var(--txt2)"; $("log-msg").textContent = "Logging…";
         try {
-          const res = await fetch("/log-feature", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({...curFeatures, label}) });
+          const res = await fetch("/log-feature", {
+            method:"POST",
+            headers:{ "Content-Type":"application/json", ...AUTH_HEADERS },
+            body:JSON.stringify({...curFeatures, label})
+          });
+          if (res.status === 401) throw new Error("API key rejected.");
           if (!res.ok) throw new Error("Failed");
           const data = await res.json();
           $("log-msg").style.color = "var(--green)";
           $("log-msg").textContent = `Logged ✓ (${data.total_rows} total rows)`;
           refreshDS();
-        } catch { $("log-msg").style.color = "var(--red)"; $("log-msg").textContent = "Log failed."; }
+        } catch(e) { $("log-msg").style.color = "var(--red)"; $("log-msg").textContent = e.message || "Log failed."; }
       }
 
       async function refreshDS() {
@@ -1102,7 +1120,8 @@
         const btn = $("xgb-train-btn"), r = $("xgb-result");
         btn.disabled = true; r.style.color = "var(--txt2)"; r.textContent = "Training…";
         try {
-          const res = await fetch("/train-model", { method:"POST" });
+          const res = await fetch("/train-model", { method:"POST", headers: AUTH_HEADERS });
+          if (res.status === 401) throw new Error("API key rejected — check UYIR_API_KEY matches the server.");
           const d = await res.json();
           if (!res.ok) throw new Error(d.error || "Training failed.");
           r.style.color = "var(--green)";
@@ -1201,7 +1220,8 @@
           renderTab(bucket); updateTabCounts(); return;
         }
         try {
-          const res = await fetch(`/api/incidents/${encodeURIComponent(iid)}`, { method:"DELETE" });
+          const res = await fetch(`/api/incidents/${encodeURIComponent(iid)}`, { method:"DELETE", headers: AUTH_HEADERS });
+          if (res.status === 401) { alert("API key rejected — check UYIR_API_KEY matches the server."); return; }
           if (!res.ok) { const d = await res.json().catch(()=>({})); alert(d.error||"Failed to delete."); return; }
           incidentStore[bucket] = (incidentStore[bucket]||[]).filter(i => i.id !== iid);
           renderTab(bucket); updateTabCounts();

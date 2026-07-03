@@ -6,6 +6,8 @@ from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 from PIL import Image
 import cv2
 
+import config
+
 # ================= CONFIG =================
 SEQUENCE_LEN = 32
 MODEL_PATH = "model_output/accident_model.pth"
@@ -17,7 +19,26 @@ CLASS_NAMES = {
 
 NUM_CLASSES = 2
 
-DEVICE = torch.device("cpu")
+
+def _resolve_device():
+    """
+    Was hardcoded to CPU regardless of what hardware the process ran on —
+    silently wasting any available GPU. Now honors config.DEVICE_MODE
+    ("auto" / "cpu" / "cuda", settable via the UYIR_DEVICE env var).
+    """
+    mode = getattr(config, "DEVICE_MODE", "auto")
+    if mode == "cpu":
+        return torch.device("cpu")
+    if mode == "cuda":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        print("[WARN] UYIR_DEVICE=cuda requested but no CUDA device found — falling back to CPU.")
+        return torch.device("cpu")
+    # auto
+    return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+
+DEVICE = _resolve_device()
 
 # ================= TRANSFORM =================
 # Must match training transform (resize size + normalization).
@@ -89,7 +110,7 @@ checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
 model.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 
-print("Model Loaded Successfully")
+print(f"Model Loaded Successfully (device={DEVICE}, mode={config.DEVICE_MODE})")
 
 
 # ================= IMAGE PREDICT =================

@@ -14,6 +14,7 @@ It now uses exactly the same detection logic as the web pipeline in app.py:
 """
 
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -35,6 +36,7 @@ from phases.phase_b_trajectory import (
 )
 from phases.phase_c_anomaly import analyze_anomaly
 from tracking.deepsort_module import Track
+from utils.calibration import get_calibration
 from utils.optical_flow import compute_optical_flow
 
 logger = logging.getLogger("AccidentDetector")
@@ -80,17 +82,34 @@ class AccidentDetector:
         self.location = location or config.CAMERA_LOCATION
         self.accident_model = None
         self._consec_count = 0
-        self._last_alert_time = 0.0
+        # Spatial + temporal cooldown: list of (timestamp, (x, y)) for
+        # recent confirmed alerts, instead of one single global timestamp.
+        # See _in_spatial_cooldown() — a second, physically distinct
+        # collision elsewhere in the same camera's view is no longer
+        # blanket-suppressed just because another one fired recently.
+        self._recent_alerts = []
         self._prev_gray = None
 
         # DL feature buffer — same as app.py
         self._features_buffer = []
         self._lstm_scores_history = []   # rolling window for peak computation
 
-        if os.path.exists(config.ACCIDENT_MODEL_PATH):
+        # Camera calibration (pixel -> meters). Disabled and None unless
+        # config.CALIBRATION_ENABLED is set AND a real calibration file
+        # exists for this exact camera_id — see utils/calibration.py.
+        self.calibration = None
+        if config.CALIBRATION_ENABLED:
+            self.calibration = get_calibration(self.camera_id)
+            if self.calibration is None:
+                logger.warning(
+                    f"[Detector] CALIBRATION_ENABLED but no calibration file found "
+                    f"for camera '{self.camera_id}' — falling back to pixel thresholds."
+                )
+
+        if os.path.exists(config.STAGE1_YOLO_GATE_PATH):
             try:
                 from ultralytics import YOLO
-                self.accident_model = YOLO(config.ACCIDENT_MODEL_PATH)
+                self.accident_model = YOLO(config.STAGE1_YOLO_GATE_PATH)
                 logger.info("[Detector] Stage-1 accident model loaded.")
             except Exception as e:
                 logger.warning(f"[Detector] Stage-1 model failed to load: {e}")
@@ -159,7 +178,8 @@ class AccidentDetector:
     # ------------------------------------------------------------------
     # Main analysis — Option 2 pipeline
     # ------------------------------------------------------------------
-    def analyze(self, frame: np.ndarray, vehicles: dict, frame_num: int) -> Optional[AccidentEvent]:
+    def analyze(self, frame: np.ndarray, vehicles: dict, frame_num: int,
+                effective_fps: float = None) -> Optional[AccidentEvent]:
         now = time.time()
 
         # ── 1. DL inference ─────────────────────────────────────────
@@ -168,11 +188,16 @@ class AccidentDetector:
         # ── 2. DL gate ───────────────────────────────────────────────
         dl_confirmed = lstm_peak >= config.DL_GATE_THRESHOLD
 
-        # ── 3. Cooldown ──────────────────────────────────────────────
-        in_cooldown = (now - self._last_alert_time) < config.COOLDOWN_SECONDS
-        if in_cooldown:
-            self._update_flow(frame)
-            return None
+        # NOTE: the old blanket "skip everything while in cooldown" check
+        # lived here. It's been removed because cooldown is now spatial
+        # (see _in_spatial_cooldown below) — we can't know *where* a
+        # candidate event is until Phase A/B have run, so the cooldown
+        # decision has moved to just before the consecutive-frame gate,
+        # near the end of this method. This does mean Phase A/B/C run
+        # every DL-confirmed frame even during what used to be a global
+        # cooldown window; YOLO/ByteTrack tracking (the expensive part)
+        # already ran unconditionally before this method was called, so
+        # the added cost is bounded to the phase-scoring math.
 
         # ── 4. Optional Stage-1 YOLO gate ───────────────────────────
         stage1_conf = 0.0
@@ -195,7 +220,9 @@ class AccidentDetector:
         self._prev_gray = gray.copy()
 
         # ── 7. Phase signals ─────────────────────────────────────────
-        candidate_pairs = proximity_filter(tracks)
+        candidate_pairs = proximity_filter(
+            tracks, calibration=self.calibration, effective_fps=effective_fps
+        )
 
         ttc_score = 0.0
         trajectory_stop_score = 0.0
@@ -299,7 +326,18 @@ class AccidentDetector:
         )
         fusion_score = max(fuse_res["score"], lstm_peak * 0.8)
 
-        # ── 10. Consecutive-frame gate ────────────────────────────────
+        # ── 10. Spatial + temporal cooldown ───────────────────────────
+        # Computed here (not up-front) because it needs to know roughly
+        # *where* this candidate event is, which requires the phase
+        # signals above. A second, physically distinct collision in the
+        # same camera view is no longer suppressed just because another
+        # incident fired elsewhere recently.
+        event_location = self._event_location(tracks, involved_ids)
+        if self._in_spatial_cooldown(event_location, now):
+            self._consec_count = 0
+            return None
+
+        # ── 11. Consecutive-frame gate ────────────────────────────────
         if fusion_score >= config.FUSION_THRESHOLD:
             self._consec_count += 1
         else:
@@ -308,9 +346,9 @@ class AccidentDetector:
         if self._consec_count < config.CONSECUTIVE_FRAMES:
             return None
 
-        # ── 11. Confirmed accident ────────────────────────────────────
+        # ── 12. Confirmed accident ────────────────────────────────────
         self._consec_count = 0
-        self._last_alert_time = now
+        self._record_alert(event_location, now)
 
         confirmed_phases = list(phases_detail.keys())
         trigger = (
@@ -372,6 +410,30 @@ class AccidentDetector:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         self._prev_gray = gray.copy()
 
+    def _event_location(self, tracks, involved_ids):
+        """Rough (x, y) pixel location of a candidate event — the mean
+        centroid of the tracks actually involved in the triggering
+        pair(s), falling back to the mean of all visible tracks."""
+        pts = [t.get_centroid() for t in tracks if t.track_id in involved_ids]
+        if not pts:
+            pts = [t.get_centroid() for t in tracks]
+        if not pts:
+            return (0.0, 0.0)
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return (sum(xs) / len(xs), sum(ys) / len(ys))
 
-# math import needed for the sqrt calls in analyze()
-import math
+    def _in_spatial_cooldown(self, location, now):
+        """True if a recent alert exists within COOLDOWN_SECONDS *and*
+        COOLDOWN_RADIUS_PX of `location`. Also prunes expired alerts."""
+        self._recent_alerts = [
+            (t, loc) for t, loc in self._recent_alerts
+            if now - t < config.COOLDOWN_SECONDS
+        ]
+        for t, loc in self._recent_alerts:
+            if math.hypot(location[0] - loc[0], location[1] - loc[1]) < config.COOLDOWN_RADIUS_PX:
+                return True
+        return False
+
+    def _record_alert(self, location, now):
+        self._recent_alerts.append((now, location))

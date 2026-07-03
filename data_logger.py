@@ -60,9 +60,9 @@ def run_logger(video_path, label: str, output_csv: str):
 
     tracker = VehicleTracker()
     accident_model = None
-    if os.path.exists(config.ACCIDENT_MODEL_PATH):
+    if os.path.exists(config.STAGE1_YOLO_GATE_PATH):
         from ultralytics import YOLO
-        accident_model = YOLO(config.ACCIDENT_MODEL_PATH)
+        accident_model = YOLO(config.STAGE1_YOLO_GATE_PATH)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():

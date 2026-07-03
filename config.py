@@ -3,14 +3,37 @@
 # Change model paths and thresholds here only.
 # ============================================================
 
+import os
+
+# ── Compute Device ───────────────────────────────────────────
+# "auto" picks CUDA if available, else CPU. Override with the
+# UYIR_DEVICE env var ("cpu" / "cuda") to force a specific device —
+# useful for benchmarking sustained FPS on the actual target hardware
+# before sizing a multi-camera deployment.
+DEVICE_MODE = os.environ.get("UYIR_DEVICE", "auto")
+
 # ── Model Paths ──────────────────────────────────────────────
 VEHICLE_MODEL_PATH = "yolov8n.pt"
-ACCIDENT_MODEL_PATH = "accident_model.pt"  # optional Stage-1 YOLO for stream pipeline
+# Renamed from "accident_model.pt" — that name was one character away
+# from model_output/accident_model.pth (the CNN-BiLSTM checkpoint).
+# These are two unrelated models; the near-identical names risked an
+# operator overwriting/confusing them during a field update.
+STAGE1_YOLO_GATE_PATH = "stage1_yolo_gate.pt"  # optional Stage-1 YOLO for stream pipeline
 
 # ── Camera Settings ──────────────────────────────────────────
-CAMERA_ID = "CAM_001"
-CAMERA_LOCATION = "Gandhipuram Junction"
-RTSP_URL = 0
+# Overridable via env vars so one codebase can run N camera processes
+# (e.g. one systemd unit per camera) without N code forks.
+# stream_processor.py also accepts --camera-id / --location / --source
+# on the command line, which take priority over these env defaults.
+CAMERA_ID = os.environ.get("UYIR_CAMERA_ID", "CAM_001")
+CAMERA_LOCATION = os.environ.get("UYIR_CAMERA_LOCATION", "Gandhipuram Junction")
+_rtsp_env = os.environ.get("UYIR_RTSP_URL")
+if _rtsp_env is None:
+    RTSP_URL = 0
+elif _rtsp_env.isdigit():
+    RTSP_URL = int(_rtsp_env)
+else:
+    RTSP_URL = _rtsp_env
 
 FRAME_SKIP = 3
 FRAME_WIDTH = 1280
@@ -34,6 +57,13 @@ TTC_MIN_CLOSING_SPEED = 0.5
 PROXIMITY_PX_CITY = 150
 PROXIMITY_PX_HIGHWAY = 220
 
+# NOTE: "motorcycle" and "auto" (autorickshaw) are listed here as a
+# reminder that the detector does NOT actually distinguish these —
+# YOLOv8n is COCO-trained and only produces the 5 TARGET_CLASSES below;
+# "bike" covers all two-wheelers and autorickshaws aren't detected as
+# their own class at all. Two-wheelers are a large share of Indian road
+# fatalities, so this is a real detection gap (needs fine-tuning on an
+# Indian traffic dataset), not just an unused constant.
 VEHICLE_CLASSES = {"car", "bike", "bus", "truck", "motorcycle", "auto"}
 PERSON_CLASS = "person"
 
@@ -44,6 +74,23 @@ TARGET_CLASSES = {
     5: "bus",
     7: "truck",
 }
+
+# ── Camera Calibration (pixel → metric conversion) ───────────
+# Disabled by default: no physical site survey of any camera location
+# has been performed. Only enable a camera after generating a real
+# calibration file for that exact camera_id with:
+#     python -m utils.calibration --camera <ID> --frame <snapshot.jpg>
+# (see utils/calibration.py). Running with a guessed/fabricated
+# calibration would produce confidently WRONG metric thresholds —
+# worse than the honestly-approximate pixel thresholds used today.
+CALIBRATION_ENABLED = os.environ.get("UYIR_CALIBRATION_ENABLED", "false").lower() == "true"
+CALIBRATION_DIR = "calibration"
+
+# Metric thresholds used ONLY for a camera with a valid calibration file.
+PROXIMITY_THRESHOLD_M = 5.0          # vehicle-vehicle, meters
+PROXIMITY_PERSON_THRESHOLD_M = 2.0   # vehicle-person, meters
+TTC_MAX_SECONDS = 2.0                # seconds until contact
+TTC_MIN_CLOSING_SPEED_MPS = 0.3      # m/s
 
 # ── Phase B — Trajectory Conflict ───────────────────────────
 SPEED_DROP_PERCENT = 70.0
@@ -61,6 +108,11 @@ TRAJECTORY_STOP_FRAMES = 5
 REL_VEL_PREV_DIFF_MIN = 8.0
 REL_VEL_CURR_DIFF_MAX = 2.0
 
+# Trajectory deviation threshold — previously hardcoded as 40.0 inside
+# threshold_analyzer.py, which broke the project's own "all tunable
+# thresholds live in config.py" rule (tech_Des.md).
+TRAJECTORY_DEVIATION_THRESHOLD = 40.0
+
 # ── Phase B — Recent-motion guard ───────────────────────────
 # A track that had peak speed > this in the last N frames is
 # considered "recently moving" (post-crash stop ≠ parked car).
@@ -76,6 +128,13 @@ FLOW_HISTORY_FRAMES = 10
 CONSECUTIVE_FRAMES = 3
 COOLDOWN_SECONDS = 20.0
 FUSION_THRESHOLD = 0.55
+
+# Cooldown is now spatial, not purely per-camera: a newly confirmed
+# accident within COOLDOWN_SECONDS of a previous one is only suppressed
+# if it's also within COOLDOWN_RADIUS_PX of that earlier incident's
+# location. A second, physically distinct collision elsewhere in the
+# same camera's view (e.g. a chain-reaction pileup) can still fire.
+COOLDOWN_RADIUS_PX = 220
 
 # ── DL Gate ──────────────────────────────────────────────────
 DL_GATE_THRESHOLD = 0.55   # lstm_peak must reach this to open the gate
@@ -125,3 +184,26 @@ CLIP_BUFFER_FPS = 10
 
 # ── Data Logger ──────────────────────────────────────────────
 DATA_LOG_CSV = "uyir_data_log.csv"
+
+# ── Background Task Pool ─────────────────────────────────────
+# Bounded worker pool shared by firebase_uploader.py, app.py, and
+# stream_processor.py for clip extraction / Firebase upload / LLM
+# calls, so a burst of near-simultaneous incidents (a multi-vehicle
+# pileup, or a mis-tuned camera false-triggering rapidly) can't spawn
+# an unbounded number of raw threads. See utils/task_pool.py.
+MAX_BACKGROUND_WORKERS = int(os.environ.get("UYIR_MAX_WORKERS", "8"))
+
+# ── API Authentication (stopgap) ─────────────────────────────
+# A simple shared-secret key required via the "X-API-Key" header on
+# every mutating endpoint in app.py: DELETE /api/incidents[/{id}],
+# POST /train-model, POST /log-feature, POST /start-stream.
+#
+# This is NOT a real auth system — no per-user identity, no roles, no
+# audit trail of who acted. It only stops an anonymous person on the
+# network segment from wiping incident history or retraining the
+# refinement model. Replace with proper login/role-based access before
+# handing this over to police IT staff for production use.
+#
+# CHANGE THIS before deployment — set the UYIR_API_KEY env var, and
+# update the matching constant in templates/index.html.
+API_KEY = os.environ.get("UYIR_API_KEY", "uyir-dev-key-change-me")

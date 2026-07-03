@@ -13,7 +13,7 @@ import numpy as np
 import csv
 from PIL import Image
 
-from fastapi import FastAPI, File, UploadFile, Request
+from fastapi import FastAPI, File, UploadFile, Request, Header, Depends, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -37,11 +37,27 @@ from model import model, transform, DEVICE, predict_image, SEQUENCE_LEN
 from llm_vision_module import analyze_frame_with_llm
 from utils.incident_clip import create_video_writer, transcode_video_for_browser, extract_clip_from_file
 from utils import incident_store
+from utils.task_pool import submit as submit_bg
 from firebase_uploader import FirebaseUploader
 
 app = FastAPI()
 _firebase = FirebaseUploader()
 _firebase.retry_local_events()
+
+
+def require_api_key(x_api_key: str = Header(default=None)):
+    """
+    Stopgap auth for mutating endpoints: a shared secret required via the
+    "X-API-Key" header, checked against config.API_KEY (UYIR_API_KEY env
+    var). This is NOT a real auth system — no identity, no roles, no audit
+    trail of who acted. It only stops an anonymous person on the network
+    segment from wiping incident history, retraining the refinement model,
+    or kicking off arbitrary video-processing jobs. Replace with proper
+    login/role-based access before handing this over to police IT staff.
+    """
+    if not x_api_key or x_api_key != config.API_KEY:
+        raise HTTPException(status_code=401, detail="Missing or invalid API key.")
+    return True
 
 # ================= XGBOOST MODEL INTEGRATION =================
 CSV_FILE = "accident_features.csv"
@@ -201,7 +217,6 @@ def _push_clip_ready(job_id, incident_id, clip_url):
                 "_sent": False,
             })
 
-
 # ================= SSE STREAM ENDPOINT =================
 @app.get("/stream/{job_id}")
 async def stream_job(job_id: str):
@@ -232,7 +247,7 @@ async def stream_job(job_id: str):
                     payload = json.dumps({"incident": inc})
                     yield f"data: {payload}\n\n"
 
-            # Push any clip_ready events (confirmed clips extracted in background)
+            # Push any new clip_ready events (confirmed clips extracted in background)
             with _stream_lock:
                 clip_events = _stream_jobs.get(job_id, {}).get("clip_events", [])
             for evt in clip_events:
@@ -270,7 +285,8 @@ async def stream_job(job_id: str):
 
 # ================= START STREAMING VIDEO JOB =================
 @app.post("/start-stream")
-async def start_stream(file: UploadFile = File(...), threshold: float = 0.55):
+async def start_stream(file: UploadFile = File(...), threshold: float = 0.55,
+                        _auth: bool = Depends(require_api_key)):
     if file.content_type not in ["video/mp4", "video/avi", "video/mov", "video/quicktime"]:
         return JSONResponse(status_code=400, content={"error": "Invalid video format"})
 
@@ -364,7 +380,7 @@ def _process_video_streaming(job_id, input_path, filename, threshold):
         consec_count               = 0
         incident_stubs             = []    # suspicious/suppressed only
         all_inline_saved           = []    # confirmed incidents saved immediately
-        bg_threads                 = []    # background clip-extraction threads
+        bg_threads                 = []    # background clip-extraction futures
         source_fps                 = fps
         cooldown_frames            = max(1, int(config.COOLDOWN_SECONDS * source_fps))
 
@@ -716,7 +732,9 @@ def _process_video_streaming(job_id, input_path, filename, threshold):
                     "_sent":         False,
                 })
 
-                # Background thread: extract clip then run LLM, push clip_ready when done
+                # Background: extract clip then run LLM, push clip_ready when done.
+                # Routed through the shared bounded pool (config.MAX_BACKGROUND_WORKERS)
+                # instead of a raw threading.Thread per incident — see utils/task_pool.py.
                 def _bg_clip_llm(jid, iid, snap_fs, details_c,
                                   src, fr_idx, fps_v, tot, clip_fs, clip_url_v):
                     try:
@@ -734,17 +752,13 @@ def _process_video_streaming(job_id, input_path, filename, threshold):
                     except Exception as _ex:
                         print(f"[BG clip] {iid}: {_ex}")
 
-                _bg = threading.Thread(
-                    target=_bg_clip_llm,
-                    args=(
-                        job_id, _inc_id, _snap_fs, dict(frame_details),
-                        input_path, source_frame_idx, source_fps, total_frames,
-                        _clip_fs, _clip_url
-                    ),
-                    daemon=True,
+                _bg_future = submit_bg(
+                    _bg_clip_llm,
+                    job_id, _inc_id, _snap_fs, dict(frame_details),
+                    input_path, source_frame_idx, source_fps, total_frames,
+                    _clip_fs, _clip_url
                 )
-                _bg.start()
-                bg_threads.append(_bg)
+                bg_threads.append(_bg_future)
 
             # ── Handle suspicious / suppressed — push to SSE, save later ──
             elif dl_confirmed and not frame_accident and cooldown_ok and detection_status in ("suspicious", "suppressed"):
@@ -868,9 +882,12 @@ def _process_video_streaming(job_id, input_path, filename, threshold):
             incident_stubs, input_path, source_fps, total_frames, filename,
         )
 
-        # Wait for all background confirmed-clip threads before removing source file
-        for _t in bg_threads:
-            _t.join(timeout=60)
+        # Wait for all background confirmed-clip futures before removing source file
+        for _f in bg_threads:
+            try:
+                _f.result(timeout=60)
+            except Exception as _ex:
+                print(f"[BG wait] incident background task failed or timed out: {_ex}")
 
         if os.path.exists(input_path):
             try:
@@ -905,14 +922,14 @@ def api_incidents(limit: int = 50):
 
 
 @app.delete("/api/incidents")
-def api_clear_all_incidents():
+def api_clear_all_incidents(_auth: bool = Depends(require_api_key)):
     """Delete all incidents from the index and their media files."""
     incident_store.clear_all_incidents()
     return {"ok": True, "cleared": True}
 
 
 @app.delete("/api/incidents/{incident_id}")
-def api_delete_incident(incident_id: str):
+def api_delete_incident(incident_id: str, _auth: bool = Depends(require_api_key)):
     if not incident_store.delete_incident(incident_id):
         return JSONResponse(status_code=404, content={"error": "Incident not found"})
     return {"ok": True}
@@ -1064,7 +1081,7 @@ async def predict_image_api(file: UploadFile = File(...), threshold: float = 0.5
 
 # ================= LOG FEATURES =================
 @app.post("/log-feature")
-async def log_feature(data: FeatureLog):
+async def log_feature(data: FeatureLog, _auth: bool = Depends(require_api_key)):
     try:
         init_csv_file()
         with open(CSV_FILE, "a", newline="") as f:
@@ -1085,7 +1102,7 @@ async def log_feature(data: FeatureLog):
 
 # ================= TRAIN XGBOOST =================
 @app.post("/train-model")
-async def train_model():
+async def train_model(_auth: bool = Depends(require_api_key)):
     try:
         import pandas as pd
         from xgboost import XGBClassifier

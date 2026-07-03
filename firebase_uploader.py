@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import cv2
 
 import config
+from utils.task_pool import submit as submit_bg
 
 logger = logging.getLogger("FirebaseUploader")
 
@@ -65,11 +66,15 @@ class FirebaseUploader:
             logger.error(f"Firebase init failed: {e}")
 
     def upload_event_async(self, event, record=None):
-        threading.Thread(target=self._upload, args=(event, record), daemon=True).start()
+        # Previously a raw, uncapped threading.Thread per call — a burst of
+        # near-simultaneous incidents could spawn unbounded threads doing
+        # network I/O at once. Now routed through a shared bounded pool
+        # (config.MAX_BACKGROUND_WORKERS) — see utils/task_pool.py.
+        submit_bg(self._upload, event, record)
 
     def upload_incident_record_async(self, record):
         """Upload a dashboard incident record to Firestore (and Storage if enabled)."""
-        threading.Thread(target=self._upload_incident_record, args=(record,), daemon=True).start()
+        submit_bg(self._upload_incident_record, record)
 
     @property
     def enabled(self):

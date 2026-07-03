@@ -26,6 +26,7 @@ from health_monitor import HealthMonitor
 from tracking.vehicle_tracker import VehicleTracker
 from utils.incident_clip import write_clip_from_frames
 from utils import incident_store
+from utils.task_pool import submit as submit_bg
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,15 +37,23 @@ logger = logging.getLogger("StreamProcessor")
 
 
 class StreamProcessor:
-    def __init__(self, source=None, show_window=True):
+    def __init__(self, source=None, show_window=True, camera_id=None, camera_location=None):
         self.source = source if source is not None else config.RTSP_URL
         self.show_window = show_window
         self._running = False
         self._fps_list = []
         self._fps_lock = threading.Lock()
 
+        # Per-camera identity: CLI args (highest priority) > UYIR_CAMERA_ID /
+        # UYIR_CAMERA_LOCATION env vars (already resolved into config.CAMERA_ID
+        # / config.CAMERA_LOCATION) > hardcoded default. This lets one codebase
+        # run N camera processes (e.g. one systemd unit per camera) without
+        # editing config.py per camera.
+        self.camera_id = camera_id or config.CAMERA_ID
+        self.camera_location = camera_location or config.CAMERA_LOCATION
+
         self.tracker = VehicleTracker()
-        self.detector = AccidentDetector()
+        self.detector = AccidentDetector(camera_id=self.camera_id, location=self.camera_location)
         self.uploader = FirebaseUploader()
         self.health = HealthMonitor(fps_provider=self._get_fps)
 
@@ -68,7 +77,7 @@ class StreamProcessor:
         frame_count = 0
         processed = 0
 
-        logger.info(f"Pipeline running | camera={config.CAMERA_ID} | location={config.CAMERA_LOCATION}")
+        logger.info(f"Pipeline running | camera={self.camera_id} | location={self.camera_location}")
         logger.info("Press Q in the window to stop.\n")
 
         while self._running:
@@ -94,14 +103,18 @@ class StreamProcessor:
             self._collect_after_frames(frame)
 
             vehicles = self.tracker.process_frame(frame)
-            event = self.detector.analyze(frame, vehicles, processed)
+            # effective_fps feeds calibrated Phase-A TTC (utils/calibration.py)
+            # when calibration is enabled; harmless no-op otherwise.
+            event = self.detector.analyze(
+                frame, vehicles, processed, effective_fps=self._get_fps() or 10.0
+            )
 
             if event:
                 self._on_accident(event)
 
             if self.show_window:
                 display = self._draw_ui(frame, vehicles, event, processed)
-                cv2.imshow(f"UYIR | {config.CAMERA_ID}", display)
+                cv2.imshow(f"UYIR | {self.camera_id}", display)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
@@ -139,11 +152,7 @@ class StreamProcessor:
             if len(self._pending_clip["after_frames"]) >= self._after_frames_needed:
                 pending = self._pending_clip
                 self._pending_clip = None
-                threading.Thread(
-                    target=self._finalize_clip,
-                    args=(pending,),
-                    daemon=True,
-                ).start()
+                submit_bg(self._finalize_clip, pending)
 
     def _on_accident(self, event: AccidentEvent):
         print("\n" + "=" * 58)
@@ -203,7 +212,7 @@ class StreamProcessor:
         cv2.rectangle(display, (0, 0), (display.shape[1], 36), (20, 20, 20), -1)
         cv2.putText(
             display,
-            f"UYIR | {config.CAMERA_ID} | {config.CAMERA_LOCATION} "
+            f"UYIR | {self.camera_id} | {self.camera_location} "
             f"| Frame:{frame_num} | FPS:{avg_fps:.1f} | Vehicles:{len(vehicles)}",
             (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 200), 1,
         )
@@ -228,6 +237,18 @@ if __name__ == "__main__":
                         help="Video source: 0=webcam, RTSP URL, or video file path")
     parser.add_argument("--no_display", action="store_true",
                         help="Run without display window")
+    # Per-camera overrides — take priority over UYIR_CAMERA_ID / UYIR_CAMERA_LOCATION
+    # env vars and the hardcoded config.py defaults. Lets one process-per-camera
+    # deployment (e.g. one systemd unit per junction) share a single codebase:
+    #   python stream_processor.py --source rtsp://... \
+    #       --camera-id CAM_002 --location "Ukkadam Junction"
+    parser.add_argument("--camera-id", default=None, help="Override camera ID for this process")
+    parser.add_argument("--location", default=None, help="Override camera location label")
     args = parser.parse_args()
     source = int(args.source) if str(args.source).isdigit() else args.source
-    StreamProcessor(source=source, show_window=not args.no_display).start()
+    StreamProcessor(
+        source=source,
+        show_window=not args.no_display,
+        camera_id=args.camera_id,
+        camera_location=args.location,
+    ).start()
