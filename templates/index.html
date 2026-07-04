@@ -263,6 +263,25 @@
       .ms-l{font-size:.58rem;color:var(--txt3);font-weight:700;text-transform:uppercase}
       .ms-v{font-family:var(--mono);font-size:.85rem;font-weight:700;color:var(--txt);margin-top:.1rem}
       .inc-llm{font-size:.83rem;line-height:1.6;color:var(--txt);background:var(--surface2);border-left:3px solid var(--cyan);padding:.8rem .95rem;border-radius:0 7px 7px 0;font-style:italic}
+
+      /* WORKFLOW (ack / resolve) */
+      .wf-badge{font-size:.62rem;font-weight:800;text-transform:uppercase;letter-spacing:.04em;padding:.2rem .5rem;border-radius:5px;border:1px solid transparent}
+      .wf-new{background:rgba(59,127,255,.12);color:var(--blue);border-color:rgba(59,127,255,.3)}
+      .wf-acknowledged{background:rgba(245,158,11,.12);color:var(--warn);border-color:rgba(245,158,11,.3)}
+      .wf-resolved{background:rgba(0,224,122,.12);color:var(--green);border-color:rgba(0,224,122,.3)}
+      .wf-row{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;padding:.7rem .85rem;background:var(--surface2);border:1px solid var(--border);border-radius:7px}
+      .wf-meta{font-size:.75rem;color:var(--txt2)}
+      .wf-meta strong{color:var(--txt)}
+      .wf-actions{display:flex;gap:.5rem;flex-wrap:wrap;margin-left:auto}
+      .wf-btn{font-family:inherit;font-size:.75rem;font-weight:600;padding:.4rem .75rem;border-radius:6px;cursor:pointer;border:1px solid;transition:.15s;background:transparent}
+      .wf-btn-ack{color:var(--warn);border-color:rgba(245,158,11,.35)}
+      .wf-btn-ack:hover{background:rgba(245,158,11,.12)}
+      .wf-btn-reopen{color:var(--txt2);border-color:var(--border2)}
+      .wf-btn-reopen:hover{background:rgba(255,255,255,.05)}
+      .wf-resolve-wrap{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap}
+      .wf-reason-btn{font-family:inherit;font-size:.72rem;font-weight:600;padding:.35rem .6rem;border-radius:6px;cursor:pointer;border:1px solid var(--border2);background:transparent;color:var(--txt2);transition:.15s}
+      .wf-reason-btn:hover{border-color:var(--green);color:var(--green);background:rgba(0,224,122,.08)}
+      .wf-btn:disabled,.wf-reason-btn:disabled{opacity:.4;cursor:not-allowed}
       .empty-state{text-align:center;color:var(--txt2);padding:2.5rem;border:1px dashed var(--border);border-radius:10px;font-size:.85rem}
 
       /* XGB CARD */
@@ -568,6 +587,7 @@
       </div>
       <p style="font-size:.78rem;color:var(--txt2);margin-bottom:1.1rem">
         Confirmed = DL gate + 2 phases + 3 consecutive frames + fusion score passed. Suspicious = DL + 1 phase. Suppressed = DL + 0 phases.
+        <br />Separately, each incident also tracks operator workflow — New → Acknowledged → Resolved (with a reason) — shown as the blue/orange/green badge next to the pipeline status.
       </p>
       <div class="tab-bar">
         <button class="tab-btn active" id="tab-conf" onclick="switchTab('confirmed')">🚨 Confirmed <span class="tab-count" id="cnt-conf">0</span></button>
@@ -1141,6 +1161,8 @@
       function incCard(inc) {
         const d = inc.details || {};
         const bucket = inc.status || "confirmed";
+        const wfStatus = inc.workflow_status || "new";
+        const wfLabel = wfStatus.charAt(0).toUpperCase() + wfStatus.slice(1);
         const fused  = ((inc.confidence || 0) * 100).toFixed(1);
         const dlPct  = ((inc.dl_confidence || sv(d,"lstm_peak","cnn_lstm_prob")) * 100).toFixed(1);
         const src    = inc.source === "stream" ? "stream" : "web";
@@ -1178,6 +1200,7 @@
     </div>
     <div class="inc-head-meta">
       <span class="inc-status-badge ${bucket}">${bucket}</span>
+      <span class="wf-badge wf-${wfStatus}">${wfLabel}</span>
       <span class="inc-conf-chip">${fused}%</span>
       <span class="inc-src src-${src}">${src==="stream"?(inc.camera_id||"Camera"):"Upload"}</span>
       ${delBtn}
@@ -1193,6 +1216,7 @@
       <div class="inc-pill"><div class="inc-pill-l">CNN-LSTM DL</div><div class="inc-pill-v" style="color:var(--purple)">${dlPct}%</div></div>
     </div>
     <div class="inc-trigger"><strong>Trigger:</strong> ${inc.trigger_phase||"—"}</div>
+    ${wfBlock(inc)}
     <div class="inc-phases">
       ${mi("Phase A", sv(d,"proximity_score","ttc_score"))}
       ${mi("Phase B", sv(d,"trajectory_score","trajectory_stop_score"))}
@@ -1226,6 +1250,97 @@
           incidentStore[bucket] = (incidentStore[bucket]||[]).filter(i => i.id !== iid);
           renderTab(bucket); updateTabCounts();
         } catch(e) { console.error("deleteIncident:", e); alert("Network error."); }
+      }
+
+      // ── Operator workflow: acknowledge / resolve / reopen ──────────
+      const REASON_LABELS = {
+        confirmed_accident: "Confirmed Accident",
+        false_positive:     "False Positive",
+        duplicate:           "Duplicate",
+        test_footage:         "Test Footage",
+        other:                "Other",
+      };
+
+      function wfBlock(inc) {
+        const iid = inc.id || "";
+        const isLive = !!inc._live;
+        const wf = inc.workflow_status || "new";
+
+        if (!iid || isLive) {
+          return `<div class="wf-row"><span class="wf-meta">Workflow actions available once this incident finishes saving.</span></div>`;
+        }
+
+        if (wf === "resolved") {
+          const reasonLabel = REASON_LABELS[inc.resolution_reason] || inc.resolution_reason || "—";
+          const note = inc.resolution_note ? ` — "${inc.resolution_note}"` : "";
+          return `<div class="wf-row">
+            <span class="wf-meta"><strong>${reasonLabel}</strong>${note} · resolved ${fmtTime(inc.resolved_at)}</span>
+            <div class="wf-actions">
+              <button type="button" class="wf-btn wf-btn-reopen" onclick="reopenIncident('${iid}',event)">↺ Reopen</button>
+            </div>
+          </div>`;
+        }
+
+        const ackPart = wf === "new"
+          ? `<button type="button" class="wf-btn wf-btn-ack" onclick="acknowledgeIncident('${iid}',event)">✓ Acknowledge</button>`
+          : `<span class="wf-meta">Acknowledged ${fmtTime(inc.acknowledged_at)}</span>`;
+
+        const reasonBtns = Object.entries(REASON_LABELS).map(([key, label]) =>
+          `<button type="button" class="wf-reason-btn" onclick="resolveIncident('${iid}','${key}',event)">${label}</button>`
+        ).join("");
+
+        return `<div class="wf-row">
+          ${ackPart}
+          <div class="wf-resolve-wrap wf-actions">
+            <span class="wf-meta">Resolve as:</span>
+            ${reasonBtns}
+          </div>
+        </div>`;
+      }
+
+      async function acknowledgeIncident(iid, ev) {
+        if (ev) { ev.stopPropagation(); ev.preventDefault(); }
+        await _workflowAction(`/api/incidents/${encodeURIComponent(iid)}/acknowledge`, {});
+      }
+
+      async function resolveIncident(iid, reason, ev) {
+        if (ev) { ev.stopPropagation(); ev.preventDefault(); }
+        let note = null;
+        if (reason === "other") {
+          note = prompt("Add a short note (optional):") || null;
+        } else if (!confirm(`Resolve this incident as "${REASON_LABELS[reason] || reason}"?`)) {
+          return;
+        }
+        await _workflowAction(`/api/incidents/${encodeURIComponent(iid)}/resolve`, { reason, note });
+      }
+
+      async function reopenIncident(iid, ev) {
+        if (ev) { ev.stopPropagation(); ev.preventDefault(); }
+        if (!confirm("Reopen this incident? This clears its resolution.")) return;
+        await _workflowAction(`/api/incidents/${encodeURIComponent(iid)}/reopen`, {});
+      }
+
+      async function _workflowAction(url, body) {
+        try {
+          const res = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...AUTH_HEADERS },
+            body: JSON.stringify(body),
+          });
+          if (res.status === 401) { alert("API key rejected — check UYIR_API_KEY matches the server."); return; }
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) { alert(data.error || "Action failed."); return; }
+          const updated = data.incident;
+          if (!updated || !updated.id) return;
+          for (const bucket of ["confirmed","suspicious","suppressed"]) {
+            const idx = (incidentStore[bucket]||[]).findIndex(i => i.id === updated.id);
+            if (idx !== -1) {
+              incidentStore[bucket][idx] = { ...incidentStore[bucket][idx], ...updated };
+              renderTab(bucket);
+              return;
+            }
+          }
+        } catch(e) { console.error("workflow action failed:", e); alert("Network error."); }
       }
 
       function renderTab(bucket) {

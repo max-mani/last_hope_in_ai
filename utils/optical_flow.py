@@ -1,14 +1,51 @@
 import cv2
 import numpy as np
 
-def compute_optical_flow(prev_gray, curr_gray):
+def compute_optical_flow(prev_gray, curr_gray, scale=1.0):
     """
     Computes dense Farneback optical flow.
+
+    `scale` (0 < scale <= 1.0): when < 1.0, Farneback runs on a downsampled
+    copy of both frames (much cheaper — dense flow cost scales with pixel
+    count) and the resulting flow field is resized back up to the original
+    resolution before being returned, with vector magnitudes rescaled to
+    compensate. Every downstream caller (get_mean_flow_magnitude,
+    calculate_flow_angular_dispersion) samples the returned flow array in
+    original-frame pixel coordinates exactly as before — this is purely a
+    speed optimization, not an API change. scale=1.0 reproduces the
+    original full-resolution behavior exactly.
     """
     if prev_gray is None or curr_gray is None:
         return None
-    
-    # Farneback parameters
+
+    if scale is not None and scale < 1.0:
+        h, w = curr_gray.shape[:2]
+        small_w = max(2, int(round(w * scale)))
+        small_h = max(2, int(round(h * scale)))
+        prev_small = cv2.resize(prev_gray, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        curr_small = cv2.resize(curr_gray, (small_w, small_h), interpolation=cv2.INTER_AREA)
+
+        flow_small = cv2.calcOpticalFlowFarneback(
+            prev_small,
+            curr_small,
+            None,
+            pyr_scale=0.5,
+            levels=3,
+            winsize=15,
+            iterations=3,
+            poly_n=5,
+            poly_sigma=1.2,
+            flags=0,
+        )
+
+        flow = cv2.resize(flow_small, (w, h), interpolation=cv2.INTER_LINEAR)
+        # Displacement was measured in the downsampled grid — rescale vector
+        # magnitudes back to original-resolution pixel units.
+        flow[..., 0] /= scale
+        flow[..., 1] /= scale
+        return flow
+
+    # Farneback parameters (full resolution — original behavior)
     flow = cv2.calcOpticalFlowFarneback(
         prev_gray, 
         curr_gray, 
@@ -90,6 +127,7 @@ def calculate_flow_angular_dispersion(flow, bbox, min_magnitude=0.5):
     sin_mean = np.mean(np.sin(angles))
     
     R = np.sqrt(cos_mean**2 + sin_mean**2)
+    # Circular variance
     return float(1.0 - R)
 
 def calculate_frame_diff_ratio(prev_gray, curr_gray, bbox, threshold=20):

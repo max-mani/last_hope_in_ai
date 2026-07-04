@@ -185,6 +185,21 @@ CLIP_BUFFER_FPS = 10
 # ── Data Logger ──────────────────────────────────────────────
 DATA_LOG_CSV = "uyir_data_log.csv"
 
+# ── Performance Tuning ───────────────────────────────────────
+# Dense Farneback optical flow (Phase C) is the single most expensive
+# CPU-bound step per frame — its cost scales directly with pixel count.
+# Computing it on a downscaled copy of the frame and upsampling the flow
+# field back to full resolution before Phase C samples it (see
+# utils/optical_flow.py) is a large speed win for a small precision cost.
+# 1.0 = full resolution (original behavior, slowest). Lower = faster.
+# Tested range: 0.4–0.6 is usually a good speed/precision balance.
+OPTICAL_FLOW_SCALE = float(os.environ.get("UYIR_OPTICAL_FLOW_SCALE", "0.5"))
+
+# Override PyTorch's CPU thread pool size. Unset (None) lets model.py use
+# all logical cores, which is usually right, but on a shared box you may
+# want to leave headroom for OpenCV/ByteTrack's own threads.
+TORCH_CPU_THREADS = os.environ.get("UYIR_TORCH_THREADS")
+
 # ── Background Task Pool ─────────────────────────────────────
 # Bounded worker pool shared by firebase_uploader.py, app.py, and
 # stream_processor.py for clip extraction / Firebase upload / LLM

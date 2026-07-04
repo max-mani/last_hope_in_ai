@@ -23,11 +23,10 @@ from typing import Optional
 import cv2
 import numpy as np
 import torch
-from PIL import Image
 
 import config
 from fusion.scoring import fuse_scores
-from model import DEVICE, SEQUENCE_LEN, model, transform
+from model import DEVICE, SEQUENCE_LEN, model, transform, frame_to_tensor_fast
 from phases.phase_a_proximity import proximity_filter
 from phases.phase_b_trajectory import (
     analyze_trajectory_conflict,
@@ -136,12 +135,10 @@ class AccidentDetector:
                  early padding-induced spike cannot lock the gate open for 30
                  frames on every video.
         """
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(frame_rgb)
-        frame_feat = transform(pil_img).unsqueeze(0).to(DEVICE)
+        frame_feat_input = frame_to_tensor_fast(frame)
 
         with torch.no_grad():
-            feat = model.cnn(frame_feat)
+            feat = model.cnn(frame_feat_input)
 
         self._features_buffer.append(feat)
         if len(self._features_buffer) > SEQUENCE_LEN:
@@ -216,7 +213,10 @@ class AccidentDetector:
 
         # ── 6. Optical flow ──────────────────────────────────────────
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        flow = compute_optical_flow(self._prev_gray, gray) if self._prev_gray is not None else None
+        flow = (
+            compute_optical_flow(self._prev_gray, gray, scale=config.OPTICAL_FLOW_SCALE)
+            if self._prev_gray is not None else None
+        )
         self._prev_gray = gray.copy()
 
         # ── 7. Phase signals ─────────────────────────────────────────

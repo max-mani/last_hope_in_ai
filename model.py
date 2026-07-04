@@ -40,6 +40,16 @@ def _resolve_device():
 
 DEVICE = _resolve_device()
 
+# Was left at PyTorch's default thread count, which isn't always the full
+# core count in constrained/containerized environments. On CPU this is the
+# single biggest lever for sustained FPS on real hardware — explicit is
+# safer than relying on the default. Override with UYIR_TORCH_THREADS if a
+# specific value benchmarks better than "all cores" (e.g. leaving headroom
+# for a concurrent OpenCV/ByteTrack thread pool).
+if DEVICE.type == "cpu":
+    _cpu_threads = int(getattr(config, "TORCH_CPU_THREADS", None) or os.cpu_count() or 4)
+    torch.set_num_threads(_cpu_threads)
+
 # ================= TRANSFORM =================
 # Must match training transform (resize size + normalization).
 # Note: no random flip / color jitter here - those are train-time only.
@@ -111,6 +121,32 @@ model.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 
 print(f"Model Loaded Successfully (device={DEVICE}, mode={config.DEVICE_MODE})")
+
+
+# ================= FAST FRAME PREPROCESSING (live/video pipelines) =====
+# transform() above (PIL-based) stays the source of truth for
+# predict_image()/predict_video() so single-shot inference is byte-for-byte
+# the same as before. For the per-frame hot path in accident_detector.py
+# and app.py's streaming loop, the PIL round-trip (ndarray -> PIL.Image ->
+# PIL resize -> ToTensor -> Normalize) was a measurable per-frame cost at
+# 8fps. frame_to_tensor_fast() does the same 240x240 resize + ImageNet
+# normalize directly on the OpenCV array with cv2.resize (SIMD-accelerated)
+# and torch tensor ops, skipping PIL entirely. Output is numerically very
+# close (bilinear vs. PIL's bilinear can differ by a fraction of a pixel
+# value) but not bit-identical to transform() — if you see any drift in DL
+# scores after updating, compare a known test clip's dl_raw trace before
+# and after to confirm nothing meaningful changed.
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+_IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+
+def frame_to_tensor_fast(frame_bgr):
+    """Fast equivalent of transform(Image.fromarray(rgb)) for one OpenCV BGR frame."""
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    resized = cv2.resize(rgb, (240, 240), interpolation=cv2.INTER_LINEAR)
+    tensor = torch.from_numpy(resized).float().div_(255.0).permute(2, 0, 1).unsqueeze(0)
+    tensor = (tensor - _IMAGENET_MEAN) / _IMAGENET_STD
+    return tensor.to(DEVICE)
 
 
 # ================= IMAGE PREDICT =================

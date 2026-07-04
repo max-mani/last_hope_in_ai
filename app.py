@@ -3,6 +3,7 @@ import json
 import base64
 import asyncio
 import threading
+import logging
 from datetime import datetime, timezone
 import uuid
 import math
@@ -11,6 +12,7 @@ import cv2
 import torch
 import numpy as np
 import csv
+from typing import Optional
 from PIL import Image
 
 from fastapi import FastAPI, File, UploadFile, Request, Header, Depends, HTTPException
@@ -33,12 +35,19 @@ from phases.phase_c_anomaly import analyze_anomaly
 from utils.optical_flow import compute_optical_flow, calculate_frame_diff_ratio
 from utils.geometry import calculate_bbox_containment_ratio
 from fusion.scoring import fuse_scores
-from model import model, transform, DEVICE, predict_image, SEQUENCE_LEN
+from model import model, transform, DEVICE, predict_image, SEQUENCE_LEN, frame_to_tensor_fast
 from llm_vision_module import analyze_frame_with_llm
 from utils.incident_clip import create_video_writer, transcode_video_for_browser, extract_clip_from_file
 from utils import incident_store
 from utils.task_pool import submit as submit_bg
 from firebase_uploader import FirebaseUploader
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("UyirApp")
 
 app = FastAPI()
 _firebase = FirebaseUploader()
@@ -94,9 +103,9 @@ def load_xgboost_model():
             XGBClassifier._estimator_type = "classifier"
             xgb_clf = XGBClassifier()
             xgb_clf.load_model(XGB_MODEL_PATH)
-            print("[SUCCESS] Loaded XGBoost classifier from", XGB_MODEL_PATH)
+            logger.info(f"Loaded XGBoost classifier from {XGB_MODEL_PATH}")
         except Exception as e:
-            print("[ERROR] Failed to load XGBoost model:", e)
+            logger.error(f"Failed to load XGBoost model: {e}")
             xgb_clf = None
     else:
         xgb_clf = None
@@ -410,14 +419,16 @@ def _process_video_streaming(job_id, input_path, filename, threshold):
             elapsed  = time.time() - t_start
             proc_fps = frames_processed / elapsed if elapsed > 0.5 else 0.0
 
-            frame_rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             # ── DL inference ──────────────────────────────────────────
-            pil_img    = Image.fromarray(frame_rgb)
-            frame_feat = transform(pil_img).unsqueeze(0).to(DEVICE)
+            # frame_to_tensor_fast() replaces the old PIL round-trip
+            # (cvtColor -> Image.fromarray -> transform) with a direct
+            # cv2-based resize + normalize — same 240x240 ImageNet-normalized
+            # input the checkpoint expects, just without the PIL overhead.
+            frame_feat_input = frame_to_tensor_fast(frame)
             with torch.no_grad():
-                feat = model.cnn(frame_feat)
+                feat = model.cnn(frame_feat_input)
 
             features_buffer.append(feat)
             if len(features_buffer) > SEQUENCE_LEN:
@@ -450,7 +461,10 @@ def _process_video_streaming(job_id, input_path, filename, threshold):
             active_tracks = tracker.update(frame=frame)
 
             # ── Optical flow ──────────────────────────────────────────
-            flow = compute_optical_flow(prev_gray, frame_gray) if prev_gray is not None else None
+            flow = (
+                compute_optical_flow(prev_gray, frame_gray, scale=config.OPTICAL_FLOW_SCALE)
+                if prev_gray is not None else None
+            )
 
             # ── Scene speed ───────────────────────────────────────────
             mean_current_speed = 0.0
@@ -741,7 +755,7 @@ def _process_video_streaming(job_id, input_path, filename, threshold):
                         _llm = analyze_frame_with_llm(snap_fs, details_c)
                         incident_store.update_incident(iid, {"llm_analysis": _llm})
                     except Exception as _ex:
-                        print(f"[BG LLM] {iid}: {_ex}")
+                        logger.warning(f"[BG LLM] {iid}: {_ex}")
                     try:
                         _ok = extract_clip_from_file(
                             src, fr_idx, fps_v, clip_fs, total_frames=tot
@@ -750,7 +764,7 @@ def _process_video_streaming(job_id, input_path, filename, threshold):
                             incident_store.update_incident(iid, {"clip_url": clip_url_v})
                             _push_clip_ready(jid, iid, clip_url_v)
                     except Exception as _ex:
-                        print(f"[BG clip] {iid}: {_ex}")
+                        logger.warning(f"[BG clip] {iid}: {_ex}")
 
                 _bg_future = submit_bg(
                     _bg_clip_llm,
@@ -887,7 +901,7 @@ def _process_video_streaming(job_id, input_path, filename, threshold):
             try:
                 _f.result(timeout=60)
             except Exception as _ex:
-                print(f"[BG wait] incident background task failed or timed out: {_ex}")
+                logger.warning(f"[BG wait] incident background task failed or timed out: {_ex}")
 
         if os.path.exists(input_path):
             try:
@@ -907,7 +921,7 @@ def _process_video_streaming(job_id, input_path, filename, threshold):
         _finish_job(job_id, result=result)
 
     except Exception as e:
-        import traceback; traceback.print_exc()
+        logger.exception("Video stream processing failed")
         _finish_job(job_id, error=str(e))
 
 
@@ -933,6 +947,53 @@ def api_delete_incident(incident_id: str, _auth: bool = Depends(require_api_key)
     if not incident_store.delete_incident(incident_id):
         return JSONResponse(status_code=404, content={"error": "Incident not found"})
     return {"ok": True}
+
+
+# ================= OPERATOR WORKFLOW (ack / resolve / reopen) =================
+# States: new -> acknowledged -> resolved. See utils/incident_store.py for
+# the transition logic and RESOLUTION_REASONS. No per-operator identity yet
+# (anyone at the shared dashboard can act) — that's a deliberate scope cut
+# for now, not an oversight; add real login before treating this as an
+# audited trail of who acted.
+
+class ResolveIncidentBody(BaseModel):
+    reason: str
+    note: Optional[str] = None
+
+
+@app.get("/api/incidents/resolution-reasons")
+def api_resolution_reasons():
+    return {"reasons": sorted(incident_store.RESOLUTION_REASONS)}
+
+
+@app.post("/api/incidents/{incident_id}/acknowledge")
+def api_acknowledge_incident(incident_id: str, _auth: bool = Depends(require_api_key)):
+    record = incident_store.acknowledge_incident(incident_id)
+    if record is None:
+        return JSONResponse(status_code=404, content={"error": "Incident not found"})
+    return {"ok": True, "incident": record}
+
+
+@app.post("/api/incidents/{incident_id}/resolve")
+def api_resolve_incident(incident_id: str, body: ResolveIncidentBody,
+                          _auth: bool = Depends(require_api_key)):
+    if body.reason not in incident_store.RESOLUTION_REASONS:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Invalid reason. Must be one of: {sorted(incident_store.RESOLUTION_REASONS)}"},
+        )
+    record = incident_store.resolve_incident(incident_id, body.reason, body.note)
+    if record is None:
+        return JSONResponse(status_code=404, content={"error": "Incident not found"})
+    return {"ok": True, "incident": record}
+
+
+@app.post("/api/incidents/{incident_id}/reopen")
+def api_reopen_incident(incident_id: str, _auth: bool = Depends(require_api_key)):
+    record = incident_store.reopen_incident(incident_id)
+    if record is None:
+        return JSONResponse(status_code=404, content={"error": "Incident not found"})
+    return {"ok": True, "incident": record}
 
 
 @app.get("/api/firebase/status")
@@ -1022,7 +1083,7 @@ async def predict_image_api(file: UploadFile = File(...), threshold: float = 0.5
                 try:
                     final_score = float(xgb_clf.predict_proba(feats)[0][1])
                 except Exception as e:
-                    print("XGBoost image predict error:", e)
+                    logger.warning(f"XGBoost image predict error: {e}")
             is_accident = final_score >= threshold
             final_class = "ACCIDENT" if is_accident else "NO ACCIDENT"
 
@@ -1075,7 +1136,7 @@ async def predict_image_api(file: UploadFile = File(...), threshold: float = 0.5
         }
 
     except Exception as e:
-        import traceback; traceback.print_exc()
+        logger.exception("predict-image failed")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
@@ -1138,7 +1199,7 @@ async def train_model(_auth: bool = Depends(require_api_key)):
             "total_rows": len(df),
         }
     except Exception as e:
-        import traceback; traceback.print_exc()
+        logger.exception("train-model failed")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
@@ -1156,7 +1217,7 @@ def dataset_status():
                 class_0 = int(counts.get(0, 0))
                 class_1 = int(counts.get(1, 0))
         except Exception as e:
-            print("Error reading CSV status:", e)
+            logger.warning(f"Error reading CSV status: {e}")
     return {
         "total_rows":     total_rows,
         "class_0":        class_0,
