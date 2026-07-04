@@ -45,6 +45,36 @@
       /* PAGE */
       .page{max-width:1300px;margin:0 auto;padding:2rem 1.5rem}
       .sec-label{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:2px;color:var(--txt3);margin-bottom:.9rem}
+      .section-help{font-size:.85rem;color:var(--txt2);line-height:1.55;margin:-.4rem 0 1rem;max-width:760px}
+      .plain-note{font-size:.78rem;color:var(--txt2);background:var(--cyan-dim);border:1px solid rgba(0,207,255,.2);border-radius:8px;padding:.6rem .85rem;margin-bottom:1rem;line-height:1.5}
+      .plain-note strong{color:var(--cyan)}
+
+      /* LIVE CAMERAS (IP/RTSP) */
+      .add-cam-form{display:flex;align-items:flex-end;gap:1rem;padding:1.2rem 1.4rem;flex-wrap:wrap}
+      .add-cam-field{display:flex;flex-direction:column;gap:.4rem;flex:1;min-width:220px}
+      .add-cam-field label{font-size:.72rem;font-weight:600;color:var(--txt2)}
+      .add-cam-field input{font-family:inherit;background:var(--surface2);border:1px solid var(--border);color:var(--txt);padding:.6rem .75rem;border-radius:7px;font-size:.85rem;outline:none;transition:.15s}
+      .add-cam-field input:focus{border-color:var(--cyan)}
+      .cam-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:1.1rem;margin-bottom:1.5rem}
+      .cam-tile{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+      .cam-tile.alert-live{border-color:rgba(255,59,59,.5);box-shadow:0 0 18px 2px rgba(255,59,59,.15)}
+      .cam-tile-img-wrap{position:relative;background:#000;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;overflow:hidden}
+      .cam-tile-img-wrap img{width:100%;height:100%;object-fit:contain;display:block}
+      .cam-tile-noimg{color:var(--txt2);font-size:.75rem}
+      .cam-tile-body{padding:.85rem 1rem;display:flex;flex-direction:column;gap:.55rem}
+      .cam-tile-head{display:flex;align-items:center;justify-content:space-between;gap:.5rem}
+      .cam-tile-name{font-weight:700;font-size:.9rem}
+      .cam-tile-loc{font-size:.72rem;color:var(--txt2)}
+      .cam-status-badge{font-size:.62rem;font-weight:800;text-transform:uppercase;letter-spacing:.04em;padding:.2rem .5rem;border-radius:5px;flex-shrink:0}
+      .cs-online{background:var(--green-dim);color:var(--green)}
+      .cs-connecting{background:var(--warn-dim);color:var(--warn)}
+      .cs-offline{background:rgba(255,59,59,.12);color:var(--red)}
+      .cs-error{background:rgba(255,59,59,.12);color:var(--red)}
+      .cs-stopped{background:var(--surface2);color:var(--txt2)}
+      .cam-tile-stats{display:flex;gap:1rem;font-size:.72rem;color:var(--txt2)}
+      .cam-tile-stats span strong{color:var(--txt);font-family:var(--mono)}
+      .cam-tile-stop{font-family:inherit;font-size:.75rem;font-weight:600;padding:.4rem .7rem;border-radius:6px;cursor:pointer;background:transparent;border:1px solid rgba(255,59,59,.35);color:var(--red);transition:.15s}
+      .cam-tile-stop:hover{background:var(--red-dim)}
 
       /* CARD */
       .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
@@ -321,6 +351,7 @@
 
       <!-- UPLOAD -->
       <div class="sec-label">Upload & Analyse</div>
+      <p class="section-help">Already have a photo or video clip of a possible accident? Upload it here and the system will check it and show you its verdict below.</p>
       <div class="upload-grid">
         <div class="upload-card">
           <div class="upload-head">
@@ -357,6 +388,34 @@
           <button class="btn" id="vid-btn" onclick="runVideo()" disabled>Analyse Video</button>
         </div>
       </div>
+
+      <!-- LIVE IP CAMERAS -->
+      <div class="sec-label">Watch a Live Camera</div>
+      <p class="section-help">
+        Enter a camera's network address below to watch it continuously and get alerted automatically if an accident happens —
+        you do not need to upload anything for this. Leave the address as <span style="color:var(--cyan)">0</span> to use a webcam plugged into this computer instead.
+      </p>
+      <div class="card" style="margin-bottom:1.5rem">
+        <div class="card-head">
+          <div class="tag" style="background:var(--green-dim);color:var(--green)">LIVE</div>
+          <h2>Add a Camera</h2>
+        </div>
+        <div class="add-cam-form">
+          <div class="add-cam-field">
+            <label for="cam-source">Camera Address (IP / RTSP link, or 0 for webcam)</label>
+            <input type="text" id="cam-source" placeholder="e.g. rtsp://192.168.1.50:554/stream1  or  0" />
+          </div>
+          <div class="add-cam-field">
+            <label for="cam-location">Junction / Location Name</label>
+            <input type="text" id="cam-location" placeholder="e.g. Gandhipuram Junction" />
+          </div>
+          <button class="btn" id="cam-start-btn" onclick="startLiveCamera()">▶ Start Watching</button>
+        </div>
+        <div id="cam-err" class="alert" style="margin:0 1.4rem 1.2rem;display:none"></div>
+      </div>
+
+      <div id="cam-grid-empty" class="empty-state" style="margin-bottom:1.5rem">No cameras are being watched right now. Add one above to get started.</div>
+      <div class="cam-grid" id="cam-grid" style="display:none"></div>
 
       <!-- LIVE PANEL -->
       <div class="card" id="live-panel">
@@ -465,6 +524,10 @@
 
         <div class="card" style="margin-bottom:1.2rem">
           <div class="card-head"><h2>🔬 Detection Pipeline</h2></div>
+          <div class="plain-note" style="margin:1.2rem 1.4rem 0">
+            This shows the step-by-step technical checks the system ran to reach its decision. You don't need to understand every step —
+            the verdict and confidence score above are what matter for everyday use. This section is here for anyone who wants to verify the details.
+          </div>
           <div class="pipeline-steps">
             <div class="pipe-step">
               <div class="step-circle" id="sc-dl">🧠</div>
@@ -585,8 +648,12 @@
           </button>
         </div>
       </div>
-      <p style="font-size:.78rem;color:var(--txt2);margin-bottom:1.1rem">
-        Confirmed = DL gate + 2 phases + 3 consecutive frames + fusion score passed. Suspicious = DL + 1 phase. Suppressed = DL + 0 phases.
+      <p class="plain-note">
+        <strong>In simple terms:</strong> Confirmed = the system is highly confident this is a real accident.
+        Suspicious = something unusual happened but the system isn't fully sure. Suppressed = a weak signal that's very likely nothing.
+      </p>
+      <p style="font-size:.72rem;color:var(--txt3);margin-bottom:1.1rem">
+        Technical detail: Confirmed = DL gate + 2 phases + 3 consecutive frames + fusion score passed. Suspicious = DL + 1 phase. Suppressed = DL + 0 phases.
         <br />Separately, each incident also tracks operator workflow — New → Acknowledged → Resolved (with a reason) — shown as the blue/orange/green badge next to the pipeline status.
       </p>
       <div class="tab-bar">
@@ -601,6 +668,10 @@
       <!-- XGBOOST -->
       <div class="card" style="margin-top:2rem">
         <div class="card-head"><div class="tag" style="background:var(--blue-dim);color:var(--blue)">ML</div><h2>XGBoost Refinement Model</h2></div>
+        <div class="plain-note" style="margin:1.2rem 1.4rem 0">
+          <strong>In simple terms:</strong> this is an optional add-on that gets smarter as more results are labeled below ("No Incident" / "Mark Incident").
+          It never overrides the main system's decision — it only helps fine-tune borderline cases once enough labeled examples are collected.
+        </div>
         <div class="xgb-body">
           <div>
             <div class="sec-label">Dataset Status</div>
@@ -613,7 +684,12 @@
           <div style="display:flex;flex-direction:column;gap:.85rem">
             <div class="sec-label">Train Model</div>
             <p style="font-size:.8rem;color:var(--txt2)">Requires ≥ 50 labeled rows per class. XGBoost only refines — it cannot override a DL+phase confirmed detection.</p>
-            <button class="btn-outline" id="xgb-train-btn" onclick="trainXGB()">Train XGBoost Classifier</button>
+            <div style="display:flex;gap:.65rem;flex-wrap:wrap">
+              <button class="btn-outline" id="xgb-train-btn" onclick="trainXGB()">Train XGBoost Classifier</button>
+              <button class="btn-outline" id="xgb-clear-btn" onclick="clearXGBDataset()"
+                style="border-color:rgba(255,59,59,.35);color:var(--red)">🗑 Clear Dataset</button>
+            </div>
+            <p style="font-size:.72rem;color:var(--txt3)">"Clear Dataset" only deletes the logged rows above — it does not delete or turn off an already-trained model.</p>
             <div id="xgb-result" style="font-size:.78rem;color:var(--txt2)"></div>
           </div>
         </div>
@@ -930,6 +1006,7 @@
 
         const fake = {
           id:               inc.id || ("live-" + Date.now()),  // use real id when provided
+          timestamp:        new Date().toISOString(),          // shown immediately, not "—" until reload
           source:           "web",
           location:         "Live feed",
           time_in_video_sec: inc.time_sec,
@@ -939,6 +1016,7 @@
           trigger_phase:    inc.trigger_phase,
           details:          inc.details || {},
           status:           bucket,
+          workflow_status:  "new",
           clip_url:         inc.clip_url || null,
           snapshot_url:     inc.snapshot_url || null,
           llm_analysis:     null,
@@ -969,6 +1047,132 @@
         }
       }
 
+      // ── Live IP/RTSP cameras (dashboard-started) ────────────────────
+      let camPollTimer = null;
+      const camImgTimers = {};   // camera_id -> interval id for its thumbnail refresh
+
+      async function startLiveCamera() {
+        const source = $("cam-source").value.trim();
+        const location = $("cam-location").value.trim();
+        const errBox = $("cam-err");
+        errBox.style.display = "none";
+
+        if (!source) {
+          errBox.textContent = "Please enter a camera IP/RTSP address, or 0 for a webcam.";
+          errBox.style.display = "block";
+          return;
+        }
+
+        const btn = $("cam-start-btn");
+        btn.disabled = true; btn.textContent = "Connecting…";
+        try {
+          const res = await fetch("/api/live-cameras", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...AUTH_HEADERS },
+            body: JSON.stringify({ source, location: location || source }),
+          });
+          if (res.status === 401) throw new Error("API key rejected — check UYIR_API_KEY matches the server.");
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || "Could not start camera.");
+          $("cam-source").value = ""; $("cam-location").value = "";
+          refreshLiveCameras();
+        } catch(e) {
+          errBox.textContent = e.message || "Could not start camera.";
+          errBox.style.display = "block";
+        } finally {
+          btn.disabled = false; btn.textContent = "▶ Start Watching";
+        }
+      }
+
+      async function stopLiveCamera(camId, ev) {
+        if (ev) { ev.stopPropagation(); ev.preventDefault(); }
+        if (!confirm(`Stop watching "${camId}"?`)) return;
+        try {
+          const res = await fetch(`/api/live-cameras/${encodeURIComponent(camId)}`, {
+            method: "DELETE", headers: AUTH_HEADERS,
+          });
+          if (res.status === 401) { alert("API key rejected — check UYIR_API_KEY matches the server."); return; }
+          if (camImgTimers[camId]) { clearInterval(camImgTimers[camId]); delete camImgTimers[camId]; }
+          refreshLiveCameras();
+        } catch(e) { console.error("stopLiveCamera:", e); alert("Network error."); }
+      }
+
+      const CAM_STATUS_LABELS = {
+        connecting: "Connecting…", online: "Watching", offline: "Signal Lost",
+        error: "Error", stopped: "Stopped",
+      };
+
+      function camTile(cam) {
+        const statusClass = "cs-" + (cam.status || "connecting");
+        const statusLabel = CAM_STATUS_LABELS[cam.status] || cam.status;
+        const imgId = `cam-img-${cam.camera_id}`;
+        return `<div class="cam-tile" data-camid="${cam.camera_id}">
+  <div class="cam-tile-img-wrap">
+    <img id="${imgId}" alt="${cam.location}" style="display:none" onerror="this.style.display='none'" onload="this.style.display='block'" />
+    <div class="cam-tile-noimg">${cam.status === "online" ? "Waiting for first frame…" : statusLabel}</div>
+  </div>
+  <div class="cam-tile-body">
+    <div class="cam-tile-head">
+      <div>
+        <div class="cam-tile-name">${cam.location || cam.camera_id}</div>
+        <div class="cam-tile-loc">${cam.camera_id} · ${cam.source}</div>
+      </div>
+      <span class="cam-status-badge ${statusClass}">${statusLabel}</span>
+    </div>
+    <div class="cam-tile-stats">
+      <span>FPS: <strong>${cam.fps ?? 0}</strong></span>
+      <span>Frames: <strong>${cam.frame_count ?? 0}</strong></span>
+    </div>
+    ${cam.error ? `<div class="wf-meta" style="color:var(--red)">${cam.error}</div>` : ""}
+    <button type="button" class="cam-tile-stop" onclick="stopLiveCamera('${cam.camera_id}',event)">■ Stop Watching</button>
+  </div>
+</div>`;
+      }
+
+      function renderCamGrid(cameras) {
+        const grid = $("cam-grid");
+        const empty = $("cam-grid-empty");
+        if (!cameras.length) {
+          grid.style.display = "none"; grid.innerHTML = "";
+          empty.style.display = "block";
+          Object.keys(camImgTimers).forEach(id => clearInterval(camImgTimers[id]));
+          return;
+        }
+        empty.style.display = "none";
+        grid.style.display = "grid";
+        grid.innerHTML = cameras.map(camTile).join("");
+
+        cameras.forEach(cam => {
+          const imgId = `cam-img-${cam.camera_id}`;
+          const refreshImg = () => {
+            const img = $(imgId);
+            if (img) img.src = `/api/live-cameras/${encodeURIComponent(cam.camera_id)}/frame?t=${Date.now()}`;
+          };
+          if (cam.status === "online" && !camImgTimers[cam.camera_id]) {
+            refreshImg();
+            camImgTimers[cam.camera_id] = setInterval(refreshImg, 1200);
+          } else if (cam.status !== "online" && camImgTimers[cam.camera_id]) {
+            clearInterval(camImgTimers[cam.camera_id]);
+            delete camImgTimers[cam.camera_id];
+          }
+        });
+
+        // Stop refreshing thumbnails for any camera no longer in the list
+        const liveIds = new Set(cameras.map(c => c.camera_id));
+        Object.keys(camImgTimers).forEach(id => {
+          if (!liveIds.has(id)) { clearInterval(camImgTimers[id]); delete camImgTimers[id]; }
+        });
+      }
+
+      async function refreshLiveCameras() {
+        try {
+          const res = await fetch("/api/live-cameras");
+          if (!res.ok) return;
+          const data = await res.json();
+          renderCamGrid(data.cameras || []);
+        } catch(e) { console.error("refreshLiveCameras:", e); }
+      }
+
       // ── Threshold slider ───────────────────────────────────────────
       $("thr-slider").addEventListener("input", () => {
         const t = parseInt($("thr-slider").value);
@@ -985,10 +1189,10 @@
         $("v-icon").className = "v-icon " + (acc ? "acc" : "ok");
         $("v-icon").textContent = acc ? "🚨" : "✅";
         $("v-text").className = acc ? "acc" : "ok";
-        $("v-text").textContent = acc ? "INCIDENT DETECTED" : "NO INCIDENT";
+        $("v-text").textContent = acc ? "ACCIDENT DETECTED" : "NO ACCIDENT DETECTED";
         $("v-sub").textContent = acc
-          ? "Multi-stage pipeline confirmed accident"
-          : "No accident detected in this footage";
+          ? "The system found strong evidence of a road accident in this footage."
+          : "The system did not find enough evidence of a road accident in this footage.";
         $("conf-num").className = "conf-num " + (acc ? "acc" : "ok");
         $("conf-fill").className = "conf-fill " + (acc ? "acc" : "ok");
       }
@@ -1151,6 +1355,22 @@
         finally { btn.disabled = false; }
       }
 
+      async function clearXGBDataset() {
+        if (!confirm("Clear all logged training rows for the XGBoost model? This does not delete or disable an already-trained model — it just clears the labeled dataset used to train the next one.")) return;
+        const btn = $("xgb-clear-btn"), r = $("xgb-result");
+        btn.disabled = true;
+        try {
+          const res = await fetch("/api/xgboost/clear-dataset", { method:"POST", headers: AUTH_HEADERS });
+          if (res.status === 401) throw new Error("API key rejected — check UYIR_API_KEY matches the server.");
+          const d = await res.json();
+          if (!res.ok) throw new Error(d.error || "Failed to clear dataset.");
+          r.style.color = "var(--green)";
+          r.textContent = "Dataset cleared.";
+          refreshDS();
+        } catch(e) { r.style.color = "var(--red)"; r.textContent = e.message; }
+        finally { btn.disabled = false; }
+      }
+
       // ── Incident history ───────────────────────────────────────────
       function fmtTime(ts) {
         if (!ts) return "—";
@@ -1165,10 +1385,13 @@
         const wfLabel = wfStatus.charAt(0).toUpperCase() + wfStatus.slice(1);
         const fused  = ((inc.confidence || 0) * 100).toFixed(1);
         const dlPct  = ((inc.dl_confidence || sv(d,"lstm_peak","cnn_lstm_prob")) * 100).toFixed(1);
-        const src    = inc.source === "stream" ? "stream" : "web";
-        const isLive = !!inc._live;
+        const src    = (inc.source === "stream" || inc.source === "live_ip") ? "stream" : "web";
         const iid    = inc.id || "";
-        const canDel = iid && !isLive;
+        // A real backend id (not the "live-..." placeholder used before the
+        // server has assigned one) can be acted on immediately — no need
+        // to wait for a full page reload just because it arrived via SSE.
+        const isPending = !iid || iid.startsWith("live-");
+        const canDel = iid && !isPending;
 
         // Clip: if clip_url is available show video; if incident is confirmed and clip not yet ready show loading
         let clipHtml;
@@ -1182,7 +1405,7 @@
 
         const snap = inc.snapshot_url
           ? `<img src="${inc.snapshot_url}?t=${Date.now()}" alt="Accident frame">`
-          : `<div class="inc-media-empty">${isLive ? `Frame at t=${inc.time_in_video_sec}s` : "Frame unavailable"}</div>`;
+          : `<div class="inc-media-empty">${inc._live ? `Frame at t=${inc.time_in_video_sec}s` : "Frame unavailable"}</div>`;
 
         const llmHtml = inc.llm_analysis ? `<div class="inc-llm">${inc.llm_analysis}</div>` : "";
         const mi = (l, v) => `<div class="mini-score"><div class="ms-l">${l}</div><div class="ms-v">${typeof v==="number"?v.toFixed(2):v}</div></div>`;
@@ -1263,11 +1486,11 @@
 
       function wfBlock(inc) {
         const iid = inc.id || "";
-        const isLive = !!inc._live;
+        const isPending = !iid || iid.startsWith("live-");
         const wf = inc.workflow_status || "new";
 
-        if (!iid || isLive) {
-          return `<div class="wf-row"><span class="wf-meta">Workflow actions available once this incident finishes saving.</span></div>`;
+        if (isPending) {
+          return `<div class="wf-row"><span class="wf-meta">Workflow actions available once this incident finishes saving (usually a few seconds).</span></div>`;
         }
 
         if (wf === "resolved") {
@@ -1385,8 +1608,14 @@
 
       // ── Init ──────────────────────────────────────────────────────
       window.addEventListener("DOMContentLoaded", () => {
-        refreshDS(); loadHistory();
+        refreshDS(); loadHistory(); refreshLiveCameras();
         $("thr-marker").style.left = "55%";
+        // Keep Incident History in sync on its own — this is what makes
+        // accidents from a live IP camera (which has no other push channel
+        // to this page) and background-filled fields (clip/LLM text) show
+        // up within a few seconds instead of needing a manual refresh.
+        setInterval(loadHistory, 7000);
+        setInterval(refreshLiveCameras, 2000);
       });
     </script>
   </body>

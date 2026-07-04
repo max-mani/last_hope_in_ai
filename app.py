@@ -16,12 +16,13 @@ from typing import Optional
 from PIL import Image
 
 from fastapi import FastAPI, File, UploadFile, Request, Header, Depends, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Response
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import config
+import live_camera_manager
 from detection.yolo_module import YOLODetector
 from tracking.deepsort_module import VehicleTracker
 from phases.phase_a_proximity import proximity_filter
@@ -1005,6 +1006,61 @@ def api_firebase_status():
     }
 
 
+# ================= LIVE IP/RTSP CAMERAS (dashboard-started) =================
+# Lets an operator start watching a camera directly from the dashboard by
+# pasting its IP/RTSP address — no CLI, no separate stream_processor.py
+# process. See live_camera_manager.py for the concurrency caveats.
+
+class LiveCameraStartBody(BaseModel):
+    location: str
+    source: str                    # IP/RTSP URL, or "0" for the server's webcam
+    camera_id: Optional[str] = None
+
+
+@app.post("/api/live-cameras")
+def api_start_live_camera(body: LiveCameraStartBody, _auth: bool = Depends(require_api_key)):
+    camera_id = (body.camera_id or "").strip() or f"CAM_{uuid.uuid4().hex[:6].upper()}"
+    source_str = (body.source or "").strip()
+    if not source_str:
+        return JSONResponse(status_code=400, content={"error": "Camera IP/RTSP address is required."})
+    source = int(source_str) if source_str.isdigit() else source_str
+
+    try:
+        live_camera_manager.start_camera(
+            camera_id, body.location or camera_id, source, _firebase
+        )
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:
+        logger.exception("Failed to start live camera")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+    return {"ok": True, "camera_id": camera_id}
+
+
+@app.delete("/api/live-cameras/{camera_id}")
+def api_stop_live_camera(camera_id: str, _auth: bool = Depends(require_api_key)):
+    if not live_camera_manager.stop_camera(camera_id):
+        return JSONResponse(status_code=404, content={"error": "Camera not found"})
+    return {"ok": True}
+
+
+@app.get("/api/live-cameras")
+def api_list_live_cameras():
+    return {"cameras": live_camera_manager.list_cameras()}
+
+
+@app.get("/api/live-cameras/{camera_id}/frame")
+def api_live_camera_frame(camera_id: str):
+    session = live_camera_manager.get_camera(camera_id)
+    if session is None:
+        return JSONResponse(status_code=404, content={"error": "Camera not found"})
+    jpeg = session.snapshot_jpeg()
+    if jpeg is None:
+        return JSONResponse(status_code=404, content={"error": "No frame available yet"})
+    return Response(content=jpeg, media_type="image/jpeg")
+
+
 # ================= IMAGE PREDICTION =================
 @app.post("/predict-image")
 async def predict_image_api(file: UploadFile = File(...), threshold: float = 0.50):
@@ -1200,6 +1256,27 @@ async def train_model(_auth: bool = Depends(require_api_key)):
         }
     except Exception as e:
         logger.exception("train-model failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/api/xgboost/clear-dataset")
+async def clear_xgboost_dataset(_auth: bool = Depends(require_api_key)):
+    """
+    Clears the logged accident_features.csv rows used to train the
+    XGBoost refinement model — the "Log for Model Improvement" button's
+    accumulated data. Does NOT delete or unload an already-trained model:
+    if one is currently active it keeps refining detections exactly as
+    before, until you explicitly retrain or restart the server. This is
+    purely a clean slate for the next round of labeling.
+    """
+    try:
+        if os.path.exists(CSV_FILE):
+            os.remove(CSV_FILE)
+        init_csv_file()
+        logger.info("XGBoost training dataset cleared.")
+        return {"ok": True, "message": "Dataset cleared."}
+    except Exception as e:
+        logger.exception("Failed to clear XGBoost dataset")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
