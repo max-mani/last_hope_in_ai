@@ -42,6 +42,8 @@ from utils.incident_clip import create_video_writer, transcode_video_for_browser
 from utils import incident_store
 from utils.task_pool import submit as submit_bg
 from firebase_uploader import FirebaseUploader
+import llm_verifier
+import xgboost_trainer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -183,6 +185,77 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+
+
+def _auto_verify_and_train(record: dict):
+    """
+    Runs after ANY confirmed accident (video upload or live camera) is
+    saved — called from a background task, never inline with detection.
+
+    1. Sends the incident's snapshot to the external LLM verifier
+       (kishore-28k50/accident-call) for an independent second opinion.
+    2. Logs the incident's own feature vector as a labeled XGBoost
+       training row, using the LLM's verdict as the label (1 = real
+       accident, 0 = false positive) — this is the "automatically added
+       to XGBoost" step.
+    3. Retrains XGBoost if there's now enough data (>= 50 rows/class,
+       same threshold the manual "Train Model" button uses), and reloads
+       the newly-trained model into this running server.
+
+    Every step is best-effort: a network hiccup talking to the LLM space,
+    or not having enough data yet, just means "nothing happened this
+    time" — it never touches the incident record's own detection result.
+    """
+    try:
+        snapshot_url = record.get("snapshot_url")
+        incident_id = record.get("id")
+        if not snapshot_url or not incident_id:
+            return
+
+        snap_path = os.path.join(BASE_DIR, snapshot_url.lstrip("/"))
+        if not os.path.exists(snap_path):
+            logger.warning(f"[AutoVerify] {incident_id}: snapshot not found at {snap_path}")
+            return
+
+        verdict = llm_verifier.verify_accident_frame(snap_path)
+        incident_store.update_incident(incident_id, {"llm_verification": verdict})
+
+        if verdict.get("accident_detected") is None:
+            logger.warning(
+                f"[AutoVerify] {incident_id}: no usable LLM verdict "
+                f"({verdict.get('error') or 'unknown reason'}) — skipping auto-label."
+            )
+            return
+
+        label = 1 if verdict["accident_detected"] else 0
+        details = record.get("details") or {}
+        xgboost_trainer.log_feature_row({
+            "proximity":     details.get("proximity_score", 0.0),
+            "trajectory":    details.get("trajectory_score", 0.0),
+            "anomaly":       details.get("flow_score", 0.0),
+            "cnn":           details.get("lstm_peak", details.get("cnn_lstm_prob", 0.0)),
+            "occlusion":     details.get("occlusion_score", 0.0),
+            "merge":         details.get("merge_score", 0.0),
+            "kinetic":       details.get("energy_drop", 0.0),
+            "density":       details.get("traffic_density", 0.0),
+            "avg_speed":     details.get("avg_speed", 0.0),
+            "stopped_ratio": details.get("stopped_ratio", 0.0),
+        }, label)
+        logger.info(
+            f"[AutoVerify] {incident_id}: LLM says accident="
+            f"{verdict['accident_detected']} (confidence={verdict.get('confidence_percent')}) "
+            f"-> logged as label={label}"
+        )
+
+        result = xgboost_trainer.retrain()
+        if result.get("trained"):
+            load_xgboost_model()
+            logger.info(
+                f"[AutoVerify] Auto-retrained XGBoost "
+                f"(accuracy={result['accuracy']:.3f}, rows={result['total_rows']})."
+            )
+    except Exception:
+        logger.exception("[AutoVerify] pipeline failed")
 
 
 # ================= STREAMING STATE =================
@@ -774,6 +847,7 @@ def _process_video_streaming(job_id, input_path, filename, threshold):
                     _clip_fs, _clip_url
                 )
                 bg_threads.append(_bg_future)
+                submit_bg(_auto_verify_and_train, _record)
 
             # ── Handle suspicious / suppressed — push to SSE, save later ──
             elif dl_confirmed and not frame_accident and cooldown_ok and detection_status in ("suspicious", "suppressed"):
@@ -1006,6 +1080,25 @@ def api_firebase_status():
     }
 
 
+@app.delete("/api/firebase/incidents")
+def api_clear_firebase_incidents(_auth: bool = Depends(require_api_key)):
+    """
+    Clears the cloud (Firestore) copy of incident records. Separate from
+    the local "Clear All" button above — that one only wipes the
+    dashboard's own index (utils/incident_store.py); this wipes what's
+    been backed up to Firebase. Neither one automatically triggers the
+    other, on purpose.
+    """
+    if not _firebase.enabled:
+        return JSONResponse(status_code=400, content={"error": "Firebase is not connected — nothing to clear."})
+    try:
+        deleted = _firebase.clear_all_incidents()
+        return {"ok": True, "deleted": deleted}
+    except Exception as e:
+        logger.exception("Failed to clear Firebase incidents")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 # ================= LIVE IP/RTSP CAMERAS (dashboard-started) =================
 # Lets an operator start watching a camera directly from the dashboard by
 # pasting its IP/RTSP address — no CLI, no separate stream_processor.py
@@ -1027,7 +1120,8 @@ def api_start_live_camera(body: LiveCameraStartBody, _auth: bool = Depends(requi
 
     try:
         live_camera_manager.start_camera(
-            camera_id, body.location or camera_id, source, _firebase
+            camera_id, body.location or camera_id, source, _firebase,
+            on_confirmed=_auto_verify_and_train,
         )
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
@@ -1059,6 +1153,49 @@ def api_live_camera_frame(camera_id: str):
     if jpeg is None:
         return JSONResponse(status_code=404, content={"error": "No frame available yet"})
     return Response(content=jpeg, media_type="image/jpeg")
+
+
+async def _mjpeg_generator(camera_id: str, session):
+    """
+    Continuously pushes the camera's latest annotated frame as a
+    multipart/x-mixed-replace stream — the standard trick for smooth
+    "live video" in a plain <img> tag with no client-side JS polling.
+    Previously the dashboard polled a single-JPEG endpoint on a timer and
+    fully rebuilt each grid tile's HTML periodically, which destroyed and
+    recreated the <img> element on every poll — visible as ~2s of video
+    followed by ~2s blank while the fresh element waited for its next
+    poll. Polling is gone now; this connection stays open and streams
+    continuously until the browser tab closes or the camera is stopped.
+    """
+    boundary = b"uyirframe"
+    delay = 1.0 / max(1, config.LIVE_STREAM_FPS)
+    last_jpeg = None
+    while True:
+        current = live_camera_manager.get_camera(camera_id)
+        if current is not session:
+            break  # camera was stopped (or restarted as a new session) — end this stream
+
+        jpeg = session.snapshot_jpeg()
+        if jpeg is not None and jpeg is not last_jpeg:
+            last_jpeg = jpeg
+            yield (
+                b"--" + boundary + b"\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                + jpeg + b"\r\n"
+            )
+        await asyncio.sleep(delay)
+
+
+@app.get("/api/live-cameras/{camera_id}/mjpeg")
+async def api_live_camera_mjpeg(camera_id: str):
+    session = live_camera_manager.get_camera(camera_id)
+    if session is None:
+        return JSONResponse(status_code=404, content={"error": "Camera not found"})
+    return StreamingResponse(
+        _mjpeg_generator(camera_id, session),
+        media_type="multipart/x-mixed-replace; boundary=uyirframe",
+    )
 
 
 # ================= IMAGE PREDICTION =================

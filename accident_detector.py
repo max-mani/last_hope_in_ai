@@ -16,6 +16,7 @@ It now uses exactly the same detection logic as the web pipeline in app.py:
 import logging
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -88,6 +89,14 @@ class AccidentDetector:
         # blanket-suppressed just because another one fired recently.
         self._recent_alerts = []
         self._prev_gray = None
+
+        # Live per-frame telemetry — lets any caller (the dashboard's live
+        # camera view, in particular) show the exact same DL-gate/phase/
+        # fusion breakdown that the video-upload SSE path already shows,
+        # instead of only finding out about fully-confirmed accidents.
+        # Updated on every analyze() call, read via get_telemetry().
+        self._telemetry_lock = threading.Lock()
+        self.last_telemetry = {}
 
         # DL feature buffer — same as app.py
         self._features_buffer = []
@@ -185,17 +194,6 @@ class AccidentDetector:
         # ── 2. DL gate ───────────────────────────────────────────────
         dl_confirmed = lstm_peak >= config.DL_GATE_THRESHOLD
 
-        # NOTE: the old blanket "skip everything while in cooldown" check
-        # lived here. It's been removed because cooldown is now spatial
-        # (see _in_spatial_cooldown below) — we can't know *where* a
-        # candidate event is until Phase A/B have run, so the cooldown
-        # decision has moved to just before the consecutive-frame gate,
-        # near the end of this method. This does mean Phase A/B/C run
-        # every DL-confirmed frame even during what used to be a global
-        # cooldown window; YOLO/ByteTrack tracking (the expensive part)
-        # already ran unconditionally before this method was called, so
-        # the added cost is bounded to the phase-scoring math.
-
         # ── 4. Optional Stage-1 YOLO gate ───────────────────────────
         stage1_conf = 0.0
         if self.accident_model is not None:
@@ -203,12 +201,22 @@ class AccidentDetector:
             if stage1_conf < config.STAGE1_GATE_CONFIDENCE:
                 self._consec_count = 0
                 self._update_flow(frame)
+                self._set_telemetry(
+                    frame_num=frame_num, dl_raw=cnn_lstm_prob, dl_peak=lstm_peak,
+                    dl_confirmed=dl_confirmed, tracks=len(vehicles),
+                    status="scanning", trigger=f"Stage-1 gate not cleared ({stage1_conf:.2f})",
+                )
                 return None
 
         # ── 5. Track conversion ──────────────────────────────────────
         tracks = [_tracked_vehicle_to_track(v) for v in vehicles.values()]
         if len(tracks) < 2:
             self._update_flow(frame)
+            self._set_telemetry(
+                frame_num=frame_num, dl_raw=cnn_lstm_prob, dl_peak=lstm_peak,
+                dl_confirmed=dl_confirmed, tracks=len(tracks),
+                status="scanning", trigger="Not enough tracked vehicles",
+            )
             return None
 
         # ── 6. Optical flow ──────────────────────────────────────────
@@ -288,8 +296,16 @@ class AccidentDetector:
             for t in tracks if t.velocities
         ]
         avg_speed = sum(speeds) / len(speeds) if speeds else 0.0
+        traffic_density = min(len(tracks) / 20.0, 1.0)
 
         # ── 8. Option 2 decision logic ────────────────────────────────
+        # Mirrors app.py's video-upload tiering exactly (scanning / pending
+        # / suspicious / suppressed / confirmed) instead of only ever
+        # reporting "nothing" until a full confirmation — this is what lets
+        # the live-camera dashboard show the same build-up telemetry
+        # (DL gate, phase bars, fused score) that the video-upload SSE
+        # preview already shows, and makes it obvious when the pipeline is
+        # actually seeing partial signal vs. truly seeing nothing.
         phase_a_signal = ttc_score
         phase_b_signal = max(trajectory_stop_score, emergency_stop_score, relative_velocity_score)
         phase_c_signal = optical_flow_score
@@ -307,12 +323,8 @@ class AccidentDetector:
                 phases_signalling += 1
                 phases_detail["phase_c"] = True
 
-        # Not enough signal
-        if not dl_confirmed or phases_signalling < 2:
-            self._consec_count = 0
-            return None
-
-        # ── 9. Fusion score ───────────────────────────────────────────
+        # Always compute the fused score now, even on weak/no signal, so
+        # every tier below has a real number instead of just "not enough".
         fuse_res = fuse_scores(
             trajectory_stop=trajectory_stop_score,
             ttc_critical=ttc_score,
@@ -324,36 +336,74 @@ class AccidentDetector:
             avg_scene_speed=avg_speed,
             stopped_ratio=stopped_ratio,
         )
-        fusion_score = max(fuse_res["score"], lstm_peak * 0.8)
 
-        # ── 10. Spatial + temporal cooldown ───────────────────────────
-        # Computed here (not up-front) because it needs to know roughly
-        # *where* this candidate event is, which requires the phase
-        # signals above. A second, physically distinct collision in the
-        # same camera view is no longer suppressed just because another
-        # incident fired elsewhere recently.
-        event_location = self._event_location(tracks, involved_ids)
-        if self._in_spatial_cooldown(event_location, now):
-            self._consec_count = 0
-            return None
-
-        # ── 11. Consecutive-frame gate ────────────────────────────────
-        if fusion_score >= config.FUSION_THRESHOLD:
-            self._consec_count += 1
+        if not dl_confirmed:
+            frame_score = float(cnn_lstm_prob)
+            frame_accident = False
+            detection_status = "scanning"
+            frame_trigger = f"DL Gate Not Cleared ({lstm_peak:.2f})"
+        elif phases_signalling >= 2:
+            frame_score = max(fuse_res["score"], lstm_peak * 0.8)
+            frame_accident = True
+            detection_status = "pending"
+            frame_trigger = (
+                f"DL + {' & '.join(p.replace('phase_', 'Phase ').upper() for p in phases_detail)} Verified"
+            )
+        elif phases_signalling == 1:
+            frame_score = fuse_res["score"] * 0.7
+            frame_accident = False
+            detection_status = "suspicious"
+            frame_trigger = "DL Confirmed, 1 Phase Only"
         else:
-            self._consec_count = 0
+            frame_score = fuse_res["score"] * 0.5
+            frame_accident = False
+            detection_status = "suppressed"
+            frame_trigger = "DL Confirmed, No Phase Signal"
 
-        if self._consec_count < config.CONSECUTIVE_FRAMES:
+        # ── 9. Spatial + temporal cooldown ───────────────────────────
+        # Computed every frame now (not just on the "pending" tier) so the
+        # consecutive-frame counter below can correctly hold steady rather
+        # than reset while a genuine candidate event is merely waiting out
+        # a nearby recent alert.
+        event_location = self._event_location(tracks, involved_ids)
+        cooldown_active = self._in_spatial_cooldown(event_location, now)
+
+        # ── 10. Consecutive-frame gate (leaky bucket) ─────────────────
+        # A single dropped/noisy frame no longer resets progress to zero —
+        # it decays by one instead, same as the video-upload path. This
+        # matters a lot more now that CONSECUTIVE_FRAMES defaults to 5:
+        # a hard reset-on-any-miss made that much harder to ever satisfy
+        # on real, slightly-noisy footage.
+        if frame_accident and not cooldown_active:
+            self._consec_count += 1
+        elif not frame_accident:
+            self._consec_count = max(0, self._consec_count - 1)
+
+        confirmed_accident = (
+            frame_accident
+            and not cooldown_active
+            and self._consec_count >= config.CONSECUTIVE_FRAMES
+        )
+
+        self._set_telemetry(
+            frame_num=frame_num,
+            dl_raw=cnn_lstm_prob, dl_peak=lstm_peak, dl_confirmed=dl_confirmed,
+            phase_a=phase_a_signal, phase_b=phase_b_signal, phase_c=phase_c_signal,
+            votes=phases_signalling,
+            fused_score=frame_score,
+            status="confirmed" if confirmed_accident else detection_status,
+            tracks=len(tracks), speed=avg_speed, density=traffic_density,
+            stopped=stopped_ratio, trigger=frame_trigger, consec=self._consec_count,
+        )
+
+        if not confirmed_accident:
             return None
 
-        # ── 12. Confirmed accident ────────────────────────────────────
+        # ── 11. Confirmed accident ────────────────────────────────────
         self._consec_count = 0
         self._record_alert(event_location, now)
 
         confirmed_phases = list(phases_detail.keys())
-        trigger = (
-            f"DL + {' & '.join(p.replace('phase_', 'Phase ').upper() for p in confirmed_phases)} Verified"
-        )
 
         fusion_details = dict(fuse_res["details"])
         fusion_details.update({
@@ -370,7 +420,7 @@ class AccidentDetector:
             "spin_score":              float(spin_score),
             "lstm_peak":               float(lstm_peak),
             "cnn_lstm_prob":           float(cnn_lstm_prob),
-            "traffic_density":         float(min(len(tracks) / 20.0, 1.0)),
+            "traffic_density":         float(traffic_density),
             "avg_speed":               float(avg_speed),
             "stopped_ratio":           float(stopped_ratio),
             "scene_interruption":      0.0,
@@ -387,12 +437,12 @@ class AccidentDetector:
             location=self.location,
             timestamp=now,
             frame_num=frame_num,
-            confidence_score=min(1.0, fusion_score),
+            confidence_score=min(1.0, frame_score),
             stage1_confidence=stage1_conf,
             phases_triggered=list(set(confirmed_phases)),
             involved_vehicle_ids=list(set(involved_ids)),
             snapshot_frame=frame.copy(),
-            trigger_phase=trigger,
+            trigger_phase=frame_trigger,
             fusion_details=fusion_details,
             cnn_lstm_confidence=lstm_peak,
         )
@@ -437,3 +487,38 @@ class AccidentDetector:
 
     def _record_alert(self, location, now):
         self._recent_alerts.append((now, location))
+
+    def _set_telemetry(self, **kwargs):
+        """
+        Store the latest per-frame telemetry snapshot. Field names
+        deliberately mirror app.py's SSE `metrics` dict (dl_raw, dl_peak,
+        phase_a/b/c, votes, fused_score, status, tracks, speed, density,
+        stopped, trigger, consec) so the same frontend rendering code can
+        be reused for both the video-upload preview and the live-camera
+        dashboard view.
+        """
+        snapshot = {
+            "frame": kwargs.get("frame_num", 0),
+            "dl_raw": round(float(kwargs.get("dl_raw", 0.0)), 3),
+            "dl_peak": round(float(kwargs.get("dl_peak", 0.0)), 3),
+            "dl_confirmed": bool(kwargs.get("dl_confirmed", False)),
+            "phase_a": round(float(kwargs.get("phase_a", 0.0)), 3),
+            "phase_b": round(float(kwargs.get("phase_b", 0.0)), 3),
+            "phase_c": round(float(kwargs.get("phase_c", 0.0)), 3),
+            "votes": int(kwargs.get("votes", 0)),
+            "fused_score": round(float(kwargs.get("fused_score", 0.0)), 3),
+            "status": kwargs.get("status", "scanning"),
+            "tracks": int(kwargs.get("tracks", 0)),
+            "speed": round(float(kwargs.get("speed", 0.0)), 2),
+            "density": round(float(kwargs.get("density", 0.0)), 2),
+            "stopped": round(float(kwargs.get("stopped", 0.0)), 2),
+            "trigger": kwargs.get("trigger", ""),
+            "consec": int(kwargs.get("consec", 0)),
+            "updated_at": time.time(),
+        }
+        with self._telemetry_lock:
+            self.last_telemetry = snapshot
+
+    def get_telemetry(self):
+        with self._telemetry_lock:
+            return dict(self.last_telemetry)

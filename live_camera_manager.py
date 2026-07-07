@@ -47,11 +47,17 @@ class LiveCameraSession:
     """One dashboard-started live camera. Owns its own tracker + detector
     so multiple cameras never share tracking state."""
 
-    def __init__(self, camera_id, location, source, firebase_uploader):
+    def __init__(self, camera_id, location, source, firebase_uploader, on_confirmed=None):
         self.camera_id = camera_id
         self.location = location
         self.source = source
         self.firebase = firebase_uploader
+        # Optional callback invoked (via the shared background task pool)
+        # with the saved incident record after a confirmed accident is
+        # written to disk — used by app.py to run the external LLM
+        # verification + auto-labeling + auto-retrain pipeline. Left as
+        # None from stream_processor.py/CLI usage, where it doesn't apply.
+        self.on_confirmed = on_confirmed
 
         self.tracker = VehicleTracker()
         self.detector = AccidentDetector(camera_id=camera_id, location=location)
@@ -66,6 +72,10 @@ class LiveCameraSession:
         self._latest_jpeg = None
         self._status = "connecting"   # connecting | online | offline | error | stopped
         self._error = None
+        # Recomputed in _connect() from the camera's own reported FPS —
+        # see config.LIVE_TARGET_FPS. Starts at the static fallback so
+        # there's always a sane value before the first successful connect.
+        self._frame_skip = max(1, config.FRAME_SKIP)
 
         buffer_len = int(config.CLIP_SECONDS_BEFORE * config.CLIP_BUFFER_FPS)
         after_len = int(config.CLIP_SECONDS_AFTER * config.CLIP_BUFFER_FPS)
@@ -92,7 +102,7 @@ class LiveCameraSession:
     def status(self):
         with self._state_lock:
             fps = round(float(np.mean(self._fps_list)), 1) if self._fps_list else 0.0
-            return {
+            base = {
                 "camera_id": self.camera_id,
                 "location": self.location,
                 "source": str(self.source),
@@ -102,6 +112,13 @@ class LiveCameraSession:
                 "started_at": datetime.fromtimestamp(self.started_at, tz=timezone.utc).isoformat(),
                 "error": self._error,
             }
+        # Merged outside the state lock — get_telemetry() has its own lock
+        # and reads a fully-independent snapshot, so this can't deadlock.
+        # This is what lets the dashboard show the exact same DL gate /
+        # phase A/B/C / fused-score breakdown for a live camera that the
+        # video-upload SSE preview already shows.
+        base["telemetry"] = self.detector.get_telemetry()
+        return base
 
     # ------------------------------------------------------------------
     def _set_status(self, status, error=None):
@@ -136,7 +153,7 @@ class LiveCameraSession:
                 continue
 
             raw_frame_count += 1
-            if raw_frame_count % config.FRAME_SKIP != 0:
+            if raw_frame_count % self._frame_skip != 0:
                 continue
 
             frame = cv2.resize(frame, (config.FRAME_WIDTH, config.FRAME_HEIGHT))
@@ -178,11 +195,34 @@ class LiveCameraSession:
             cap = cv2.VideoCapture(self.source)
             if cap.isOpened():
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                logger.info(f"[{self.camera_id}] Connected to {self.source}")
+                self._update_frame_skip(cap)
+                logger.info(
+                    f"[{self.camera_id}] Connected to {self.source} "
+                    f"(frame_skip={self._frame_skip}, target={config.LIVE_TARGET_FPS}fps)"
+                )
                 return cap
             logger.warning(f"[{self.camera_id}] Connection attempt {attempt + 1}/{attempts} failed...")
             time.sleep(2)
         return None
+
+    def _update_frame_skip(self, cap):
+        """
+        A fixed frame-skip (the old behavior) caps sustained processed FPS
+        at (native_fps / skip) no matter how fast the pipeline itself can
+        run — e.g. a 24fps RTSP source with a skip of 3 tops out at 8fps
+        even on hardware that could easily process 20. Instead, pick a
+        skip factor from the camera's own reported FPS that targets
+        config.LIVE_TARGET_FPS processed frames per second directly.
+        Many RTSP sources misreport FPS (0, absurdly high, or NaN) — fall
+        back to the static config.FRAME_SKIP when that happens rather than
+        trust a bogus value.
+        """
+        native_fps = cap.get(cv2.CAP_PROP_FPS)
+        target = max(1, config.LIVE_TARGET_FPS)
+        if native_fps and 1.0 <= native_fps <= 120.0:
+            self._frame_skip = max(1, round(native_fps / target))
+        else:
+            self._frame_skip = max(1, config.FRAME_SKIP)
 
     def _get_fps(self):
         with self._state_lock:
@@ -253,15 +293,17 @@ class LiveCameraSession:
             "status": "confirmed",
         })
         self.firebase.upload_incident_record_async(record)
+        if self.on_confirmed is not None:
+            submit_bg(self.on_confirmed, record)
 
 
 # ================= Session registry =================
-def start_camera(camera_id, location, source, firebase_uploader):
+def start_camera(camera_id, location, source, firebase_uploader, on_confirmed=None):
     with _sessions_lock:
         existing = _sessions.get(camera_id)
         if existing is not None and existing.is_alive():
             raise ValueError(f"Camera '{camera_id}' is already running.")
-        session = LiveCameraSession(camera_id, location, source, firebase_uploader)
+        session = LiveCameraSession(camera_id, location, source, firebase_uploader, on_confirmed=on_confirmed)
         _sessions[camera_id] = session
     session.start()
     return session

@@ -125,8 +125,8 @@ BBOX_DEFORM_RATIO = 0.25
 FLOW_HISTORY_FRAMES = 10
 
 # ── Gate Settings ────────────────────────────────────────────
-CONSECUTIVE_FRAMES = 3
-COOLDOWN_SECONDS = 20.0
+CONSECUTIVE_FRAMES = 5
+COOLDOWN_SECONDS = 30.0
 FUSION_THRESHOLD = 0.55
 
 # Cooldown is now spatial, not purely per-camera: a newly confirmed
@@ -186,6 +186,22 @@ CLIP_BUFFER_FPS = 10
 DATA_LOG_CSV = "uyir_data_log.csv"
 
 # ── Performance Tuning ───────────────────────────────────────
+# Target frame rate for the dashboard's live MJPEG camera preview
+# (live_camera_manager.py). This is a display cap, not a detection cap —
+# the pipeline keeps analyzing every processed frame at whatever FPS it
+# can sustain; this just controls how often a fresh frame is pushed to
+# the browser. 10-15 looks smooth to a human viewer and costs far less
+# bandwidth/CPU than pushing every frame the pipeline produces.
+LIVE_STREAM_FPS = int(os.environ.get("UYIR_LIVE_STREAM_FPS", "15"))
+
+# Live cameras pick their own frame-skip at connect time instead of using
+# the fixed FRAME_SKIP above: a fixed skip of N caps sustained processed
+# FPS at (camera's native FPS / N), which silently varies a lot between
+# cameras (e.g. a 24fps RTSP source with FRAME_SKIP=3 tops out at 8fps
+# no matter how fast the pipeline itself runs). Instead, live_camera_
+# manager.py reads the camera's reported FPS and picks a skip factor that
+# targets this many *processed* frames per second directly.
+LIVE_TARGET_FPS = int(os.environ.get("UYIR_LIVE_TARGET_FPS", "15"))
 # Dense Farneback optical flow (Phase C) is the single most expensive
 # CPU-bound step per frame — its cost scales directly with pixel count.
 # Computing it on a downscaled copy of the frame and upsampling the flow

@@ -417,6 +417,70 @@
       <div id="cam-grid-empty" class="empty-state" style="margin-bottom:1.5rem">No cameras are being watched right now. Add one above to get started.</div>
       <div class="cam-grid" id="cam-grid" style="display:none"></div>
 
+      <!-- CAMERA DETAIL VIEW (opened by clicking a camera tile) -->
+      <div class="card" id="cam-detail-panel" style="display:none;margin-bottom:1.5rem">
+        <div class="card-head">
+          <div class="tag" style="background:var(--red-dim);color:var(--red)">LIVE</div>
+          <h2 id="cam-detail-title">Camera</h2>
+          <div style="margin-left:auto;display:flex;align-items:center;gap:.75rem">
+            <span id="cam-detail-badge"><span class="det-badge det-scanning">● Scanning</span></span>
+            <button class="btn btn-sm" onclick="hideCameraDetail()">✕ Back to Grid</button>
+          </div>
+        </div>
+        <div class="live-layout">
+          <div class="live-video-wrap no-signal" id="cam-detail-vw">
+            <img id="cam-detail-img" style="display:none;width:100%;max-height:520px;object-fit:contain" />
+          </div>
+          <div class="live-sidebar">
+            <div class="ls-label">Processing</div>
+            <div class="ls-group">
+              <div class="lm"><div class="lm-l">FPS</div><div class="lm-v" id="cd-fps">—</div></div>
+              <div class="lm"><div class="lm-l">Frames Processed</div><div class="lm-v" id="cd-frames">—</div></div>
+              <div class="lm"><div class="lm-l">Tracks</div><div class="lm-v" id="cd-tracks">—</div></div>
+            </div>
+            <div class="ls-label">Scene State</div>
+            <div class="ls-group">
+              <div class="lm"><div class="lm-l">Density</div><div class="lm-v" id="cd-density">—</div></div>
+              <div class="lm"><div class="lm-l">Avg Speed</div><div class="lm-v" id="cd-speed">—</div></div>
+              <div class="lm"><div class="lm-l">Stopped</div><div class="lm-v" id="cd-stopped">—</div></div>
+            </div>
+            <div class="ls-label">Detection</div>
+            <div class="ls-group">
+              <div class="lm"><div class="lm-l">DL Score (Frame)</div><div class="lm-v" id="cd-dl">—</div></div>
+              <div class="lm"><div class="lm-l">DL Gate (Peak ≥0.55)</div><div class="lm-v" id="cd-dl-gate">—</div></div>
+              <div class="lm"><div class="lm-l">Phase Votes</div><div class="lm-v" id="cd-votes">—</div></div>
+              <div class="lm"><div class="lm-l">Fused Score</div><div class="lm-v" id="cd-score">—</div></div>
+              <div class="lm"><div class="lm-l">Consecutive Frames</div><div class="lm-v" id="cd-consec">—</div></div>
+            </div>
+            <div class="ls-label">Phase Bars</div>
+            <div class="mini-bar-wrap">
+              <div class="mini-bar-row">
+                <div class="mini-bar-l">Phase A</div>
+                <div class="mini-bar-track"><div class="mini-bar-fill bar-a" id="cd-bar-a" style="width:0%"></div></div>
+                <div class="mini-bar-v" id="cd-val-a">0.00</div>
+              </div>
+              <div class="mini-bar-row">
+                <div class="mini-bar-l">Phase B</div>
+                <div class="mini-bar-track"><div class="mini-bar-fill bar-b" id="cd-bar-b" style="width:0%"></div></div>
+                <div class="mini-bar-v" id="cd-val-b">0.00</div>
+              </div>
+              <div class="mini-bar-row">
+                <div class="mini-bar-l">Phase C</div>
+                <div class="mini-bar-track"><div class="mini-bar-fill bar-c" id="cd-bar-c" style="width:0%"></div></div>
+                <div class="mini-bar-v" id="cd-val-c">0.00</div>
+              </div>
+              <div class="mini-bar-row">
+                <div class="mini-bar-l">DL Frame</div>
+                <div class="mini-bar-track"><div class="mini-bar-fill bar-dl" id="cd-bar-dl" style="width:0%"></div></div>
+                <div class="mini-bar-v" id="cd-val-dl">0.00</div>
+              </div>
+            </div>
+            <div class="ls-label">Trigger</div>
+            <p style="font-size:.78rem;color:var(--txt2)" id="cd-trigger">—</p>
+          </div>
+        </div>
+      </div>
+
       <!-- LIVE PANEL -->
       <div class="card" id="live-panel">
         <div class="card-head">
@@ -642,12 +706,19 @@
         <h2 style="font-size:1.1rem;font-weight:800">Incident History</h2>
         <div style="display:flex;gap:.65rem">
           <button class="btn btn-sm" onclick="loadHistory()">↻ Refresh</button>
+          <button class="btn btn-sm" id="clear-firebase-btn" onclick="clearFirebaseData()"
+            style="background:transparent;border:1px solid rgba(0,207,255,.35);color:var(--cyan)">
+            ☁ Clear Cloud Backup
+          </button>
           <button class="btn btn-sm" id="clear-all-btn" onclick="clearAllIncidents()"
             style="background:transparent;border:1px solid rgba(255,59,59,.4);color:var(--red)">
             🗑 Clear All
           </button>
         </div>
       </div>
+      <p class="section-help" style="margin-top:-.4rem">
+        "Clear All" wipes the incident list shown on this dashboard. "Clear Cloud Backup" separately deletes the copy stored in Firebase — use it if you want to reset the cloud backup without losing what's shown here (or vice versa).
+      </p>
       <p class="plain-note">
         <strong>In simple terms:</strong> Confirmed = the system is highly confident this is a real accident.
         Suspicious = something unusual happened but the system isn't fully sure. Suppressed = a weak signal that's very likely nothing.
@@ -769,6 +840,20 @@
           }
         } catch(e) { console.error("clearAllIncidents:", e); }
         finally { if (btn) { btn.disabled = false; btn.textContent = "🗑 Clear All"; } }
+      }
+
+      async function clearFirebaseData() {
+        if (!confirm("Delete ALL incident records stored in Firebase (the cloud backup)? This cannot be undone. The list shown on this dashboard is not affected.")) return;
+        const btn = $("clear-firebase-btn");
+        if (btn) { btn.disabled = true; btn.textContent = "Clearing…"; }
+        try {
+          const res = await fetch("/api/firebase/incidents", { method: "DELETE", headers: AUTH_HEADERS });
+          if (res.status === 401) { showErr("API key rejected — check UYIR_API_KEY matches the server."); return; }
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) { showErr(data.error || "Failed to clear Firebase data."); return; }
+          alert(`Cleared ${data.deleted ?? 0} record(s) from Firebase.`);
+        } catch(e) { console.error("clearFirebaseData:", e); showErr("Network error while clearing Firebase data."); }
+        finally { if (btn) { btn.disabled = false; btn.textContent = "☁ Clear Cloud Backup"; } }
       }
 
       // ── Drop zones ─────────────────────────────────────────────────
@@ -1048,8 +1133,13 @@
       }
 
       // ── Live IP/RTSP cameras (dashboard-started) ────────────────────
-      let camPollTimer = null;
-      const camImgTimers = {};   // camera_id -> interval id for its thumbnail refresh
+      // Tracks which camera ids currently have a rendered tile, so a
+      // metrics-only poll never rebuilds (and never destroys/reconnects)
+      // an already-streaming <img>. Rebuilding the tile HTML on every
+      // poll was the root cause of the "2s video, 2s blank" flicker —
+      // it destroyed the <img> element (and its open video connection)
+      // every couple of seconds.
+      let renderedCamIds = new Set();
 
       async function startLiveCamera() {
         const source = $("cam-source").value.trim();
@@ -1092,7 +1182,6 @@
             method: "DELETE", headers: AUTH_HEADERS,
           });
           if (res.status === 401) { alert("API key rejected — check UYIR_API_KEY matches the server."); return; }
-          if (camImgTimers[camId]) { clearInterval(camImgTimers[camId]); delete camImgTimers[camId]; }
           refreshLiveCameras();
         } catch(e) { console.error("stopLiveCamera:", e); alert("Network error."); }
       }
@@ -1102,14 +1191,39 @@
         error: "Error", stopped: "Stopped",
       };
 
+      function camImgLoaded(camId) {
+        const img = $(`cam-img-${camId}`);
+        const noimg = $(`cam-noimg-${camId}`);
+        if (img) img.style.display = "block";
+        if (noimg) noimg.style.display = "none";
+      }
+
+      function camImgError(camId) {
+        const img = $(`cam-img-${camId}`);
+        const noimg = $(`cam-noimg-${camId}`);
+        if (img) { img.style.display = "none"; img.removeAttribute("data-streaming"); }
+        if (noimg) noimg.style.display = "flex";
+      }
+
+      // Attaches the MJPEG stream exactly once per tile — setting
+      // img.src again while already streaming would restart the
+      // connection for no reason (and briefly blank the picture).
+      function ensureCamStreaming(camId) {
+        const img = $(`cam-img-${camId}`);
+        if (img && !img.dataset.streaming) {
+          img.dataset.streaming = "1";
+          img.src = `/api/live-cameras/${encodeURIComponent(camId)}/mjpeg`;
+        }
+      }
+
       function camTile(cam) {
         const statusClass = "cs-" + (cam.status || "connecting");
         const statusLabel = CAM_STATUS_LABELS[cam.status] || cam.status;
-        const imgId = `cam-img-${cam.camera_id}`;
         return `<div class="cam-tile" data-camid="${cam.camera_id}">
-  <div class="cam-tile-img-wrap">
-    <img id="${imgId}" alt="${cam.location}" style="display:none" onerror="this.style.display='none'" onload="this.style.display='block'" />
-    <div class="cam-tile-noimg">${cam.status === "online" ? "Waiting for first frame…" : statusLabel}</div>
+  <div class="cam-tile-img-wrap" onclick="showCameraDetail('${cam.camera_id}')" style="cursor:pointer">
+    <img id="cam-img-${cam.camera_id}" alt="${cam.location}" style="display:none"
+         onload="camImgLoaded('${cam.camera_id}')" onerror="camImgError('${cam.camera_id}')" />
+    <div class="cam-tile-noimg" id="cam-noimg-${cam.camera_id}">${statusLabel}</div>
   </div>
   <div class="cam-tile-body">
     <div class="cam-tile-head">
@@ -1117,51 +1231,148 @@
         <div class="cam-tile-name">${cam.location || cam.camera_id}</div>
         <div class="cam-tile-loc">${cam.camera_id} · ${cam.source}</div>
       </div>
-      <span class="cam-status-badge ${statusClass}">${statusLabel}</span>
+      <span class="cam-status-badge ${statusClass}" id="cam-status-${cam.camera_id}">${statusLabel}</span>
     </div>
     <div class="cam-tile-stats">
-      <span>FPS: <strong>${cam.fps ?? 0}</strong></span>
-      <span>Frames: <strong>${cam.frame_count ?? 0}</strong></span>
+      <span>FPS: <strong id="cam-fps-${cam.camera_id}">${cam.fps ?? 0}</strong></span>
+      <span>Frames: <strong id="cam-frames-${cam.camera_id}">${cam.frame_count ?? 0}</strong></span>
     </div>
-    ${cam.error ? `<div class="wf-meta" style="color:var(--red)">${cam.error}</div>` : ""}
-    <button type="button" class="cam-tile-stop" onclick="stopLiveCamera('${cam.camera_id}',event)">■ Stop Watching</button>
+    <div class="wf-meta" style="color:var(--red);display:${cam.error ? "block" : "none"}" id="cam-err-${cam.camera_id}">${cam.error || ""}</div>
+    <div style="display:flex;gap:.5rem">
+      <button type="button" class="cam-tile-stop" style="flex:1;border-color:rgba(59,127,255,.35);color:var(--blue)" onclick="showCameraDetail('${cam.camera_id}')">🔍 View Details</button>
+      <button type="button" class="cam-tile-stop" onclick="stopLiveCamera('${cam.camera_id}',event)">■ Stop</button>
+    </div>
   </div>
 </div>`;
+      }
+
+      let selectedCameraId = null;
+
+      function showCameraDetail(camId) {
+        selectedCameraId = camId;
+        $("cam-grid").style.display = "none";
+        $("cam-grid-empty").style.display = "none";
+        $("cam-detail-panel").style.display = "block";
+
+        const detailImg = $("cam-detail-img");
+        if (!detailImg.dataset.streaming) {
+          detailImg.dataset.streaming = "1";
+          detailImg.src = `/api/live-cameras/${encodeURIComponent(camId)}/mjpeg`;
+        }
+        detailImg.onload = () => { detailImg.style.display = "block"; $("cam-detail-vw").classList.remove("no-signal"); };
+        detailImg.onerror = () => { detailImg.style.display = "none"; detailImg.removeAttribute("data-streaming"); };
+
+        refreshLiveCameras();
+        setTimeout(() => $("cam-detail-panel").scrollIntoView({ behavior: "smooth", block: "start" }), 80);
+      }
+
+      function hideCameraDetail() {
+        selectedCameraId = null;
+        const detailImg = $("cam-detail-img");
+        detailImg.removeAttribute("src");
+        detailImg.removeAttribute("data-streaming");
+        detailImg.style.display = "none";
+        $("cam-detail-vw").classList.add("no-signal");
+        $("cam-detail-panel").style.display = "none";
+        renderedCamIds = new Set();  // force the grid to redraw fresh
+        refreshLiveCameras();
+      }
+
+      function updateCameraDetail(cam) {
+        if (!cam) return;
+        const t = cam.telemetry || {};
+        $("cam-detail-title").textContent = `${cam.location || cam.camera_id} (${cam.camera_id})`;
+
+        const badges = {
+          confirmed:  '<span class="det-badge det-confirmed">🚨 ACCIDENT CONFIRMED</span>',
+          pending:    '<span class="det-badge det-pending">⚡ Detecting… Building Confirmation</span>',
+          suspicious: '<span class="det-badge det-suspicious">⚠ Suspicious</span>',
+          suppressed: '<span class="det-badge det-suppressed">🔇 Suppressed</span>',
+          scanning:   '<span class="det-badge det-scanning">● Scanning</span>',
+        };
+        $("cam-detail-badge").innerHTML = badges[t.status] || badges.scanning;
+
+        $("cd-fps").textContent = (cam.fps ?? 0) + " fps";
+        $("cd-frames").textContent = cam.frame_count ?? 0;
+        $("cd-tracks").textContent = t.tracks ?? 0;
+
+        $("cd-density").textContent = (t.density ?? 0).toFixed(2);
+        $("cd-speed").textContent = (t.speed ?? 0).toFixed(2);
+        $("cd-stopped").textContent = Math.round((t.stopped ?? 0) * 100) + "%";
+
+        const dlRaw = t.dl_raw ?? 0, dlPeak = t.dl_peak ?? 0;
+        $("cd-dl").textContent = dlRaw.toFixed(3);
+        $("cd-dl-gate").textContent = dlPeak.toFixed(3) + (t.dl_confirmed ? " OPEN ✓" : " CLOSED ✗");
+        $("cd-dl-gate").className = "lm-v " + (t.dl_confirmed ? "ok" : "bad");
+        $("cd-votes").textContent = (t.votes ?? 0) + " / 3";
+        const fused = t.fused_score ?? 0;
+        $("cd-score").textContent = fused.toFixed(3);
+        $("cd-score").className = "lm-v " + (fused >= 0.55 ? "bad" : fused >= 0.35 ? "warn" : "");
+        $("cd-consec").textContent = (t.consec ?? 0) + " / 5";
+
+        const pa = t.phase_a || 0, pb = t.phase_b || 0, pc = t.phase_c || 0;
+        $("cd-bar-a").style.width = pa*100+"%"; $("cd-val-a").textContent = pa.toFixed(2);
+        $("cd-bar-b").style.width = pb*100+"%"; $("cd-val-b").textContent = pb.toFixed(2);
+        $("cd-bar-c").style.width = pc*100+"%"; $("cd-val-c").textContent = pc.toFixed(2);
+        $("cd-bar-dl").style.width = dlRaw*100+"%"; $("cd-val-dl").textContent = dlRaw.toFixed(2);
+
+        $("cd-trigger").textContent = t.trigger || "—";
+      }
+
+      function updateCamTileInPlace(cam) {
+        const statusEl = $(`cam-status-${cam.camera_id}`);
+        const fpsEl    = $(`cam-fps-${cam.camera_id}`);
+        const framesEl = $(`cam-frames-${cam.camera_id}`);
+        const errEl    = $(`cam-err-${cam.camera_id}`);
+        const noimgEl  = $(`cam-noimg-${cam.camera_id}`);
+        const statusLabel = CAM_STATUS_LABELS[cam.status] || cam.status;
+
+        if (statusEl) { statusEl.className = "cam-status-badge cs-" + (cam.status || "connecting"); statusEl.textContent = statusLabel; }
+        if (fpsEl) fpsEl.textContent = cam.fps ?? 0;
+        if (framesEl) framesEl.textContent = cam.frame_count ?? 0;
+        if (noimgEl && noimgEl.style.display !== "none") noimgEl.textContent = statusLabel;
+        if (errEl) {
+          errEl.style.display = cam.error ? "block" : "none";
+          errEl.textContent = cam.error || "";
+        }
+        if (cam.status === "online") ensureCamStreaming(cam.camera_id);
       }
 
       function renderCamGrid(cameras) {
         const grid = $("cam-grid");
         const empty = $("cam-grid-empty");
+
+        // While a camera's detail view is open, the grid stays hidden —
+        // don't fight over layout with it.
+        if (selectedCameraId) {
+          grid.style.display = "none";
+          empty.style.display = "none";
+          return;
+        }
+
         if (!cameras.length) {
           grid.style.display = "none"; grid.innerHTML = "";
           empty.style.display = "block";
-          Object.keys(camImgTimers).forEach(id => clearInterval(camImgTimers[id]));
+          renderedCamIds = new Set();
           return;
         }
         empty.style.display = "none";
         grid.style.display = "grid";
-        grid.innerHTML = cameras.map(camTile).join("");
 
-        cameras.forEach(cam => {
-          const imgId = `cam-img-${cam.camera_id}`;
-          const refreshImg = () => {
-            const img = $(imgId);
-            if (img) img.src = `/api/live-cameras/${encodeURIComponent(cam.camera_id)}/frame?t=${Date.now()}`;
-          };
-          if (cam.status === "online" && !camImgTimers[cam.camera_id]) {
-            refreshImg();
-            camImgTimers[cam.camera_id] = setInterval(refreshImg, 1200);
-          } else if (cam.status !== "online" && camImgTimers[cam.camera_id]) {
-            clearInterval(camImgTimers[cam.camera_id]);
-            delete camImgTimers[cam.camera_id];
-          }
-        });
+        const newIds = new Set(cameras.map(c => c.camera_id));
+        const idsChanged = newIds.size !== renderedCamIds.size ||
+          [...newIds].some(id => !renderedCamIds.has(id));
 
-        // Stop refreshing thumbnails for any camera no longer in the list
-        const liveIds = new Set(cameras.map(c => c.camera_id));
-        Object.keys(camImgTimers).forEach(id => {
-          if (!liveIds.has(id)) { clearInterval(camImgTimers[id]); delete camImgTimers[id]; }
-        });
+        if (idsChanged) {
+          grid.innerHTML = cameras.map(camTile).join("");
+          renderedCamIds = newIds;
+          cameras.forEach(cam => { if (cam.status === "online") ensureCamStreaming(cam.camera_id); });
+        } else {
+          // Same set of cameras as last poll — update text/badges in
+          // place only. The <img> elements are never touched here, so
+          // an already-open video stream just keeps playing.
+          cameras.forEach(updateCamTileInPlace);
+        }
       }
 
       async function refreshLiveCameras() {
@@ -1169,7 +1380,19 @@
           const res = await fetch("/api/live-cameras");
           if (!res.ok) return;
           const data = await res.json();
-          renderCamGrid(data.cameras || []);
+          const cameras = data.cameras || [];
+          renderCamGrid(cameras);
+
+          if (selectedCameraId) {
+            const cam = cameras.find(c => c.camera_id === selectedCameraId);
+            if (cam) {
+              updateCameraDetail(cam);
+            } else {
+              // The camera was stopped elsewhere (or by someone else) —
+              // don't leave the detail view pointed at nothing.
+              hideCameraDetail();
+            }
+          }
         } catch(e) { console.error("refreshLiveCameras:", e); }
       }
 
@@ -1408,6 +1631,15 @@
           : `<div class="inc-media-empty">${inc._live ? `Frame at t=${inc.time_in_video_sec}s` : "Frame unavailable"}</div>`;
 
         const llmHtml = inc.llm_analysis ? `<div class="inc-llm">${inc.llm_analysis}</div>` : "";
+        const lv = inc.llm_verification || null;
+        const lvHtml = (lv && lv.accident_detected !== null && lv.accident_detected !== undefined)
+          ? `<div class="wf-row" style="background:var(--cyan-dim);border-color:rgba(0,207,255,.25)">
+               <span class="wf-meta">
+                 <strong>AI re-check:</strong> ${lv.accident_detected ? "Confirmed as a real accident" : "Likely a false positive"}
+                 ${lv.confidence_percent != null ? ` (${lv.confidence_percent}% confidence)` : ""}
+               </span>
+             </div>`
+          : "";
         const mi = (l, v) => `<div class="mini-score"><div class="ms-l">${l}</div><div class="ms-v">${typeof v==="number"?v.toFixed(2):v}</div></div>`;
         const locLine = `${inc.location||"Upload"}${inc.time_in_video_sec!=null?` · t=${inc.time_in_video_sec}s`:""}${inc.frame_number!=null?` · frame ${inc.frame_number}`:""}`;
         const delBtn = canDel
@@ -1449,6 +1681,7 @@
       ${mi("Kinetic", sv(d,"energy_drop","emergency_stop_score"))}
       ${mi("Scene", sv(d,"scene_interruption"))}
     </div>
+    ${lvHtml}
     ${llmHtml}
   </div>
 </article>`;
@@ -1615,7 +1848,7 @@
         // to this page) and background-filled fields (clip/LLM text) show
         // up within a few seconds instead of needing a manual refresh.
         setInterval(loadHistory, 7000);
-        setInterval(refreshLiveCameras, 2000);
+        setInterval(refreshLiveCameras, 1000);
       });
     </script>
   </body>

@@ -232,6 +232,39 @@ class FirebaseUploader:
             json.dump(doc, f, indent=2)
         logger.info(f"Event saved locally: {path}")
 
+    def clear_all_incidents(self):
+        """
+        Delete every document in the Firestore incidents collection
+        (config.FIRESTORE_COLLECTION). This mirrors what the dashboard's
+        local "Clear All" button does to utils/incident_store.py's index,
+        but for the cloud copy — the two are separate actions on purpose,
+        since clearing the local dashboard view and clearing the cloud
+        backup are different operations an operator might want
+        independently.
+
+        Does NOT touch Storage blobs (snapshot/clip files) even when
+        FIREBASE_USE_STORAGE is on, and does NOT touch the local
+        `static/uploads/incidents/` files either — only the Firestore
+        documents themselves.
+
+        Returns the number of documents deleted. Raises if Firebase isn't
+        connected — check `self.enabled` before calling.
+        """
+        if not self._enabled:
+            raise RuntimeError("Firebase is not connected.")
+
+        deleted = 0
+        col_ref = self._db.collection(config.FIRESTORE_COLLECTION)
+        while True:
+            batch_docs = list(col_ref.limit(400).stream())
+            if not batch_docs:
+                break
+            for doc in batch_docs:
+                doc.reference.delete()
+                deleted += 1
+        logger.info(f"Cleared {deleted} incident document(s) from Firestore.")
+        return deleted
+
     def retry_local_events(self):
         if not self._enabled:
             return
