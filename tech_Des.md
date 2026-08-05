@@ -321,7 +321,20 @@ On confirmed accident, the system saves:
 * Snapshot JPEG
 * ±5 s incident clip (`CLIP_SECONDS_BEFORE` / `CLIP_SECONDS_AFTER`)
 * Optional LLM analysis via `llm_vision_module.py`
-* Firebase upload (async) or local JSON fallback via `incident_store.py`
+* Firebase upload (async) or local JSON fallback via `incident_store.py` — **confirmed incidents only, see §5.1**
+
+### 5.1 Cloud upload scope — confirmed only (fixed)
+
+UYIR classifies every processed frame into one of four pipeline states: `scanning`, `confirmed`, `suspicious`, or `suppressed`. All four are shown live in the dashboard (SSE feed) and saved to the **local** incident index (`utils/incident_store.py`) so an operator can review borderline detections and tune thresholds.
+
+**Only `confirmed` incidents are mirrored to Firebase.** This is enforced at every place an incident can be created:
+
+| Path | Where confirmed accidents upload | Where suspicious/suppressed are saved |
+|------|-----------------------------------|----------------------------------------|
+| Video upload (`app.py`, `_process_video_streaming`) | Immediately inline, in the `if confirmed_accident:` block — `_firebase.upload_incident_record_async(_record)` | `incident_stubs` list → written to the local index at end-of-video via `_save_incident_records()`, which now gates the Firebase call on `status == "confirmed"` |
+| Live IP camera (`live_camera_manager.py`) / CLI stream (`stream_processor.py`) | `AccidentDetector.analyze()` only ever returns an `AccidentEvent` once `confirmed_accident` is true — suspicious/suppressed frames return `None` and never reach the upload path at all | N/A — the detector doesn't emit an event for non-confirmed frames in the live path |
+
+**Prior bug (fixed):** `_save_incident_records()` used to call `_firebase.upload_incident_record_async(record)` unconditionally for every stub it saved — and since that function is only ever called with `incident_stubs` (which only ever contains `suspicious`/`suppressed` events; confirmed ones take the separate inline path above), every suspicious and suppressed detection in a processed video was being pushed to Firestore/Storage alongside genuinely confirmed accidents. The fix adds an explicit `if status == "confirmed":` guard around that upload call. Suspicious/suppressed incidents are now local-only — visible in the dashboard's own tabs, never sent to the cloud.
 
 ---
 
@@ -356,7 +369,7 @@ FastAPI server with Jinja2 dashboard at `http://127.0.0.1:8000`.
 7. Intersection risk zone multiplier (1.15× for center 50% of frame)
 8. Consecutive frame gate + cooldown check
 9. Draw annotations, telemetry panel, write H.264 MP4 (`avc1`)
-10. On confirmed accident: save snapshot, extract incident clip, optional LLM analysis, Firebase upload
+10. On confirmed accident: save snapshot, extract incident clip, optional LLM analysis, **Firebase upload** (confirmed only). On suspicious/suppressed: save snapshot + local record at end-of-video, **no Firebase upload**.
 
 ### Image processing
 
@@ -377,7 +390,7 @@ Camera/RTSP → VehicleTracker (ByteTrack)
             → AccidentDetector (Option 2: DL gate + Phases A/B/C + Fusion)
             → Consecutive frame gate + Cooldown
             → Incident clip buffer (±5 s)
-            → FirebaseUploader (async) or local JSON fallback
+            → FirebaseUploader (async, CONFIRMED accidents only) or local JSON fallback
             → HealthMonitor (30s heartbeat)
 ```
 
@@ -389,7 +402,9 @@ Camera/RTSP → VehicleTracker (ByteTrack)
 | Health heartbeat | `health_monitor.py` |
 | Incident clips | `utils/incident_clip.py`, `utils/incident_store.py` |
 
-Optional Stage-1 YOLO accident model (`accident_model.pt`) gates frames before 3-phase verification if the file exists (`STAGE1_GATE_CONFIDENCE = 0.65`); otherwise Option 2 runs directly.
+Optional Stage-1 YOLO accident model (`stage1_yolo_gate.pt`) gates frames before 3-phase verification if the file exists (`STAGE1_GATE_CONFIDENCE = 0.65`); otherwise Option 2 runs directly.
+
+`AccidentDetector.analyze()` (see `accident_detector.py`) only ever returns an `AccidentEvent` once the DL gate, 2-of-3 phase vote, consecutive-frame gate, and spatial cooldown have all passed — i.e. once the frame is genuinely `confirmed`. There is no code path in the live pipeline that uploads a suspicious or suppressed frame to Firebase; those states only ever appear in the per-frame telemetry (`get_telemetry()` / the dashboard's live camera detail view), never as a saved/uploaded incident.
 
 **Run:**
 ```bash
@@ -409,7 +424,7 @@ python stream_processor.py --source video.mp4 --no_display      # headless
 
 The data logger writes per-vehicle, per-frame raw factors to `uyir_data_log.csv` (config: `DATA_LOG_CSV`): speed, speed drop, nearest distance, IoU, trajectory deviation, bbox area change, optical flow ratio, and optional Stage-1 accident model confidence.
 
-The analyzer plots accident vs normal distributions and prints suggested updates for `config.py` (`PROXIMITY_THRESHOLD`, `SPEED_DROP_PERCENT`, `OPTICAL_FLOW_SPIKE`, etc.).
+The analyzer plots accident vs normal distributions and prints suggested updates for `config.py` (`PROXIMITY_THRESHOLD`, `SPEED_DROP_PERCENT`, `OPTICAL_FLOW_SPIKE`, etc.), reading `TRAJECTORY_DEVIATION_THRESHOLD` from `config.py` rather than a hardcoded value.
 
 ---
 
@@ -430,11 +445,13 @@ RECENTLY_MOVING_MIN_SPEED  = 3.0     # px/frame peak to count as "recently movin
 DL_GATE_THRESHOLD          = 0.55    # DL hard gate
 DL_PHASE_SIGNAL_MIN        = 0.30    # phase vote threshold
 DL_WARMUP_FRAMES           = 16      # frames before trusting rolling lstm_peak
-CONSECUTIVE_FRAMES         = 3       # frames required before alert
-COOLDOWN_SECONDS           = 20.0    # seconds between alerts per camera
+CONSECUTIVE_FRAMES         = 5       # frames required before alert
+COOLDOWN_SECONDS           = 30.0    # seconds between alerts per camera (spatial, see COOLDOWN_RADIUS_PX)
+COOLDOWN_RADIUS_PX         = 220     # cooldown only suppresses alerts within this radius of a prior one
 FUSION_THRESHOLD           = 0.55    # minimum fused score for accident
 CLIP_SECONDS_BEFORE        = 5       # incident clip pre-roll
 CLIP_SECONDS_AFTER         = 5       # incident clip post-roll
+API_KEY                    = "uyir-dev-key-change-me"  # stopgap shared-secret for mutating endpoints — CHANGE before deployment
 ```
 
 ---
@@ -453,6 +470,7 @@ When an accident is identified, the system produces:
 8. **Processed output** — H.264 MP4 or annotated JPEG in `static/uploads/`
 9. **Incident clips** — ±5 s MP4 clips in `static/uploads/incidents/`
 10. **LLM analysis** (optional) — text description of worst accident frame via Ollama LLaVA or heuristic fallback
+11. **Cloud backup** (Firebase) — confirmed incidents only; suspicious/suppressed stay local (see §5.1)
 
 ---
 

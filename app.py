@@ -143,7 +143,25 @@ def _phases_from_details(details):
 
 
 def _save_incident_records(stubs, input_path, source_fps, total_frames, location, source="web"):
-    """Save suspicious/suppressed stubs to disk at end of processing."""
+    """
+    Save suspicious/suppressed stubs to disk at end of processing.
+
+    FIX: this previously called _firebase.upload_incident_record_async()
+    for every stub unconditionally. `stubs` here is always
+    `incident_stubs` from _process_video_streaming, which ONLY ever
+    contains "suspicious" and "suppressed" events (confirmed accidents
+    are saved + uploaded immediately, inline, in a separate code path —
+    see the `if confirmed_accident:` block below). That meant every
+    suspicious/suppressed detection in a processed video was also being
+    pushed to the cloud (Firestore / Storage), not just confirmed
+    accidents.
+
+    Firebase upload is now gated on `status == "confirmed"` so only real,
+    fully-confirmed accidents ever leave this machine. Suspicious and
+    suppressed events are still saved to the local dashboard (so you can
+    review/tune thresholds from the Incident History tabs), they just
+    don't get mirrored to the cloud.
+    """
     saved_incidents = []
     for stub in stubs:
         incident_id = str(uuid.uuid4())
@@ -174,7 +192,10 @@ def _save_incident_records(stubs, input_path, source_fps, total_frames, location
             "details": details,
             "status": status,
         })
-        _firebase.upload_incident_record_async(record)
+        # Only mirror CONFIRMED incidents to Firebase — suspicious/suppressed
+        # stay local-only (dashboard history + local incident index).
+        if status == "confirmed":
+            _firebase.upload_incident_record_async(record)
         saved_incidents.append(record)
     return saved_incidents
 
@@ -406,9 +427,11 @@ def _process_video_streaming(job_id, input_path, filename, threshold):
     KEY BEHAVIOURS:
       - Confirmed accidents: snapshot saved immediately, incident pushed to SSE
         with real id, clip extracted in a parallel background thread, clip_ready
-        event pushed when done. No waiting until video ends.
+        event pushed when done. No waiting until video ends. Uploaded to
+        Firebase immediately (see the `if confirmed_accident:` block below).
       - Suspicious/suppressed events: pushed to SSE immediately but saved to disk
-        only at the end of the video.
+        (LOCAL ONLY — never uploaded to Firebase) only at the end of the video,
+        via _save_incident_records().
       - SSE status = "confirmed" ONLY when the consecutive-frame gate passes.
         Pipeline evaluation that is building up shows as "pending".
       - dl_raw  = cnn_lstm_prob for the current frame (actual model output).
@@ -803,6 +826,7 @@ def _process_video_streaming(job_id, input_path, filename, threshold):
                     "status":           "confirmed",
                 })
                 all_inline_saved.append(_record)
+                # Only CONFIRMED accidents are mirrored to Firebase.
                 _firebase.upload_incident_record_async(_record)
 
                 # Push to SSE immediately with snapshot — clip will follow via clip_ready
@@ -967,6 +991,8 @@ def _process_video_streaming(job_id, input_path, filename, threshold):
         transcode_video_for_browser(output_path)
 
         # Save suspicious/suppressed stubs to disk (these still need input_path for clip extraction)
+        # NOTE: local-only — see _save_incident_records() docstring for the
+        # Firebase-upload fix (only "confirmed" records get mirrored to the cloud).
         saved_end = _save_incident_records(
             incident_stubs, input_path, source_fps, total_frames, filename,
         )

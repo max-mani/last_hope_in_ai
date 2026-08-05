@@ -1140,6 +1140,19 @@
       // it destroyed the <img> element (and its open video connection)
       // every couple of seconds.
       let renderedCamIds = new Set();
+      const LIVE_CAM_POLL_MS = 5000;
+      let liveCamPollTimer = null;
+
+      function setLiveCamPolling(active) {
+        if (active) {
+          if (!liveCamPollTimer) {
+            liveCamPollTimer = setInterval(refreshLiveCameras, LIVE_CAM_POLL_MS);
+          }
+        } else if (liveCamPollTimer) {
+          clearInterval(liveCamPollTimer);
+          liveCamPollTimer = null;
+        }
+      }
 
       async function startLiveCamera() {
         const source = $("cam-source").value.trim();
@@ -1381,6 +1394,7 @@
           if (!res.ok) return;
           const data = await res.json();
           const cameras = data.cameras || [];
+          setLiveCamPolling(cameras.length > 0 || !!selectedCameraId);
           renderCamGrid(cameras);
 
           if (selectedCameraId) {
@@ -1846,9 +1860,10 @@
         // Keep Incident History in sync on its own — this is what makes
         // accidents from a live IP camera (which has no other push channel
         // to this page) and background-filled fields (clip/LLM text) show
-        // up within a few seconds instead of needing a manual refresh.
-        setInterval(loadHistory, 7000);
-        setInterval(refreshLiveCameras, 1000);
+        // up without needing a manual refresh.
+        setInterval(loadHistory, 15000);
+        // Live-camera polling is started/stopped by refreshLiveCameras()
+        // only when cameras are active — no idle 1 Hz hammering.
       });
     </script>
   </body>

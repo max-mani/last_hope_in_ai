@@ -125,8 +125,8 @@ BBOX_DEFORM_RATIO = 0.25
 FLOW_HISTORY_FRAMES = 10
 
 # ── Gate Settings ────────────────────────────────────────────
-CONSECUTIVE_FRAMES = 5
-COOLDOWN_SECONDS = 30.0
+CONSECUTIVE_FRAMES = 3
+COOLDOWN_SECONDS = 20.0
 FUSION_THRESHOLD = 0.55
 
 # Cooldown is now spatial, not purely per-camera: a newly confirmed

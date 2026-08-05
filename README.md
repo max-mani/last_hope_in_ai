@@ -22,7 +22,7 @@ graph LR
     PhaseC --> Vote
     Vote --> Fusion[Weighted Fusion]
     Fusion --> Alert[Consecutive Frame Gate + Cooldown]
-    Alert --> Output[Annotated Video / Firebase / Incidents]
+    Alert --> Output[Annotated Video / Firebase (confirmed only) / Incidents]
 ```
 
 ### Pipeline stages
@@ -35,7 +35,8 @@ graph LR
 6. **DL gate (Option 2)** — EfficientNet-B0 + BiLSTM + Attention on a 32-frame rolling buffer. `lstm_peak ≥ 0.55` must pass before phase signals are evaluated. CNN-LSTM weight in fusion is **0** (gate only).
 7. **2-of-3 phase vote** — After the DL gate, at least **two** of Phase A / B / C must reach score ≥ 0.30.
 8. **Score fusion** — Six weighted signals (trajectory stop, emergency stop, TTC, optical flow, flow dispersion). Optional XGBoost refinement when trained.
-9. **Alert gating** — 3 consecutive confirmed frames + 20 s cooldown. Center risk zone applies a 1.15× score multiplier.
+9. **Alert gating** — Consecutive confirmed frames + spatial cooldown (per-location, not whole-camera — see `COOLDOWN_RADIUS_PX`). Center risk zone applies a 1.15× score multiplier.
+10. **Cloud upload** — Only fully **confirmed** accidents are mirrored to Firebase. `suspicious` and `suppressed` detections are saved locally (for review/threshold-tuning in the dashboard) but never uploaded to the cloud — see [Incident Status & Cloud Upload Scope](#incident-status--cloud-upload-scope) below.
 
 ---
 
@@ -117,7 +118,7 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 - **Video upload** — Full Option 2 pipeline with ByteTrack, telemetry overlay, H.264 annotated MP4, incident clip extraction, optional LLM analysis.
 - **Streaming upload** — Real-time SSE frame preview via `/start-stream` + `/stream/{job_id}`.
 - **XGBoost training** — Log labeled features from the UI, train with `/train-model`, view status at `/dataset-status`.
-- **Incident history** — Saved clips and snapshots under `static/uploads/incidents`, listed via `/api/incidents`.
+- **Incident history** — Saved clips and snapshots under `static/uploads/incidents`, listed via `/api/incidents`. All three tiers (confirmed/suspicious/suppressed) show up here; only confirmed ones are also mirrored to Firebase.
 
 ### Live camera pipeline
 
@@ -137,6 +138,26 @@ python threshold_analyzer.py --csv uyir_data_log.csv
 
 ---
 
+## Incident Status & Cloud Upload Scope
+
+Every processed frame is classified into one of four pipeline states:
+
+| Status | Meaning | Saved locally? | Uploaded to Firebase? |
+|--------|---------|:---------------:|:----------------------:|
+| `scanning` | DL gate hasn't cleared yet | — (not an incident) | — |
+| `confirmed` | DL gate + ≥2 phases + consecutive-frame gate + cooldown all passed | ✅ | ✅ |
+| `suspicious` | DL gate passed, only 1 phase signalling | ✅ | ❌ |
+| `suppressed` | DL gate passed, no phase signalling | ✅ | ❌ |
+
+**Only `confirmed` incidents are ever mirrored to the cloud.** This is true on every entry point:
+
+- **Video upload / SSE preview (`app.py`)** — confirmed accidents are saved and uploaded immediately, inline, the moment the consecutive-frame gate passes. Suspicious/suppressed events are pushed to the live SSE preview and saved to the *local* incident index at the end of processing, but are never sent to Firebase.
+- **Live IP camera (dashboard-started) and CLI `stream_processor.py`** — the detector (`accident_detector.py`) only ever emits an incident once it's fully confirmed; suspicious/suppressed states exist only in the live telemetry panel, never as a saved or uploaded record.
+
+If you previously saw suspicious/suppressed incidents in Firestore/Storage, that was due to a bug in `app.py`'s `_save_incident_records()` helper, which uploaded every locally-saved stub regardless of its status. That function now checks `status == "confirmed"` before calling `_firebase.upload_incident_record_async()` — suspicious/suppressed incidents stay local-only going forward. (Any suspicious/suppressed documents already sitting in Firestore from before this fix aren't removed automatically — use the dashboard's "☁ Clear Cloud Backup" button, or delete them manually in the Firebase console, if you want to clean up the existing collection.)
+
+---
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -149,9 +170,12 @@ python threshold_analyzer.py --csv uyir_data_log.csv
 | GET | `/api/incidents` | List saved incident records |
 | DELETE | `/api/incidents/{id}` | Delete an incident record |
 | GET | `/api/firebase/status` | Firebase connection status |
+| DELETE | `/api/firebase/incidents` | Clear the cloud (Firestore) copy of incident records |
 | POST | `/log-feature` | Append labeled feature row to `accident_features.csv` |
 | POST | `/train-model` | Train XGBoost from CSV |
 | GET | `/dataset-status` | Row counts and XGBoost active status |
+
+Mutating endpoints (`DELETE`, `/train-model`, `/log-feature`, `/start-stream`, live-camera start/stop, and the operator acknowledge/resolve/reopen routes) require an `X-API-Key` header matching `config.API_KEY` (`UYIR_API_KEY` env var). This is a stopgap shared-secret, not a real auth system — replace with proper login before handing this over to police IT staff.
 
 ### Example: `POST /predict-video` response
 
@@ -195,8 +219,10 @@ python threshold_analyzer.py --csv uyir_data_log.csv
 | `TTC_MAX_FRAMES` | 8 | Max frames until contact |
 | `DL_GATE_THRESHOLD` | 0.55 | DL gate — must pass before phase vote |
 | `DL_PHASE_SIGNAL_MIN` | 0.30 | Minimum score for a phase to count |
-| `CONSECUTIVE_FRAMES` | 3 | Frames required before alert |
-| `COOLDOWN_SECONDS` | 20 | Seconds between alerts |
+| `CONSECUTIVE_FRAMES` | 5 | Frames required before alert |
+| `COOLDOWN_SECONDS` | 30 | Seconds between alerts at the same location |
+| `COOLDOWN_RADIUS_PX` | 220 | Cooldown only suppresses alerts within this pixel radius of a prior one (spatial, not whole-camera) |
 | `FUSION_THRESHOLD` | 0.55 | Minimum fused score |
+| `API_KEY` | `uyir-dev-key-change-me` | Shared-secret for mutating endpoints — **change before deployment** |
 
 See [`config.py`](config.py) for the full list. For architecture details, algorithms, and research references, see [`tech_Des.md`](tech_Des.md).
